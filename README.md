@@ -18,9 +18,9 @@ Studio: **File → New** (Baseplate), **Save As** `sandbox.rbxlx` here, connect,
 The demo enters itself once the character exists.
 
 ```
-drag          turn the box (mouse or touch)
+drag          turn the box (mouse or touch) — also after it opens
 click / E     engage, once the HUD says it is armed
-R             reset
+R             reset to the first stage
 Q or EXIT     leave the inspection view
 I             re-enter
 ```
@@ -77,6 +77,34 @@ lie.
 | `src/client/init.client.luau` | The demo: TUNE table, state machine, the single render step. |
 
 `bash scripts/check.sh` — sourcemap + `luau-lsp analyze` + `selene`.
+
+## Chaining stages
+
+The box stays turnable after the lid opens (`TUNE.freeLookAfterOpen`), so a second alignment
+can be authored against whatever the reveal exposed. A stage is an anchor pair, the mechanism
+it drives, and what comes next:
+
+```lua
+local core: Puzzle = {
+    name = "core",
+    near = stage.coreNear,                    -- Attachments, read live as WorldPosition
+    far = stage.coreFar,
+    nearLocal = Vector3.new(0, 0.4, 0.55),    -- the SAME points in the model's frame
+    farLocal = Vector3.new(0, 0.4, -0.55),
+    mechanism = function() return myPoser() end,  -- or nil: then the snap is the payoff
+    onSolved = nil,                           -- return another Puzzle to chain again
+}
+-- and on the stage before it:
+onSolved = function() return core end
+```
+
+`nearLocal`/`farLocal` are what the closed-form solve runs on, so they must be the
+attachments' own local positions — otherwise the snap aims at a pose where the anchors do not
+actually coincide. The solved orientation is always derived, never authored.
+
+`mechanism` returns a per-frame poser `(rootCF, dt) -> done`. It keeps being called after it
+reports done, which is what holds its parts attached while the object is turned afterwards.
+A stage with no mechanism finishes the instant the snap lands.
 
 ## Porting to demos 2–4
 

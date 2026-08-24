@@ -103,6 +103,10 @@ local TUNE = {
 
 	settleTime = 0.35, -- scoring is suspended until the rig stops moving
 	postSnapHold = 0.12, -- stillness after the snap, so the reveal reads as caused by it
+	-- Keep the object turnable once the mechanism has run. Off = it stays locked at the
+	-- solved pose until R. On = free look, which is also what lets a second stage be authored
+	-- against whatever the reveal exposed.
+	freeLookAfterOpen = true,
 	lidSweepDeg = 104,
 	lidTime = 0.75,
 	prizeRise = 0.9,
@@ -308,26 +312,78 @@ local function startSession()
 	local spin = Spin.new(TUNE.startYaw, TUNE.startPitch, feel)
 	local gate = Align.newGate(TUNE.enterFrac, TUNE.exitFrac, TUNE.armFrac, TUNE.bandFrac, TUNE.dwell)
 
-	-- The solved pose is DERIVED from the anchors and self-verified, never authored. Two
-	-- sources of truth disagreeing by a fraction of a degree is exactly the jank that would
-	-- sink this.
-	local solYaw, solPitch, solErr = Align.solve(
-		TUNE.anchorNear,
-		TUNE.anchorFar,
-		rig.distance(),
-		math.rad(feel.pitchLimitDeg)
-	)
-	if not solYaw or not solPitch then
-		warn(`[demo1] the puzzle has no reachable solution: {solErr}`)
+	--------------------------------------------------------------------------------
+	-- STAGES
+	--
+	-- A stage is an anchor PAIR plus what happens when it is solved. Return another Puzzle
+	-- from onSolved and the object chains straight into it: the box stays turnable after the
+	-- lid opens, so the next alignment can be authored against whatever the reveal exposed.
+	-- Return nil and the demo settles into free look.
+	--
+	--     local core: Puzzle = {
+	--         name = "core",
+	--         near = stage.coreNear,               -- Attachments, read live as WorldPosition
+	--         far = stage.coreFar,
+	--         nearLocal = Vector3.new(0, 0.4, 0.55),  -- the SAME points in the model's frame
+	--         farLocal = Vector3.new(0, 0.4, -0.55),
+	--         mechanism = function() return myPoser() end,   -- or nil: the snap is the payoff
+	--         onSolved = nil,
+	--     }
+	--     -- then on the first stage:  onSolved = function() return core end
+	--
+	-- nearLocal/farLocal are what the closed-form solve runs on. They must be the attachments'
+	-- own local positions, or the snap will aim at a pose where the anchors do not coincide.
+	-- The solved pose is always DERIVED, never authored: two sources of truth disagreeing by a
+	-- fraction of a degree is exactly the jank that would sink this.
+	--------------------------------------------------------------------------------
+	type Puzzle = {
+		name: string,
+		near: Attachment,
+		far: Attachment,
+		nearLocal: Vector3,
+		farLocal: Vector3,
+		-- Runs once on commit, after the snap. Return a per-frame poser (rootCF, dt) -> done
+		-- for whatever this stage opens, or nil for a stage whose payoff is the snap itself.
+		-- It keeps being called after it reports done, so it also holds its parts attached
+		-- while the object is turned afterwards.
+		mechanism: (() -> ((CFrame, number) -> boolean)?)?,
+		onSolved: (() -> Puzzle?)?,
+	}
+
+	local firstPuzzle: Puzzle = {
+		name = "lid",
+		near = stage.nearAnchor,
+		far = stage.farAnchor,
+		nearLocal = TUNE.anchorNear,
+		farLocal = TUNE.anchorFar,
+		mechanism = nil, -- assigned below: lidMechanism is declared with the other posers
+		onSolved = nil,
+	}
+	local current: Puzzle? = firstPuzzle
+
+	local targetYaw, targetPitch = 0, 0
+
+	local function aimAtCurrent(): (boolean, string?)
+		local puzzle = current
+		if not puzzle then
+			return true, nil
+		end
+		local y, pch, why = Align.solve(puzzle.nearLocal, puzzle.farLocal, rig.distance(), math.rad(feel.pitchLimitDeg))
+		if not y or not pch then
+			return false, why
+		end
+		targetYaw, targetPitch = y, pch
+		return true, nil
+	end
+
+	local aimed, aimErr = aimAtCurrent()
+	if not aimed then
+		warn(`[demo1] stage "{firstPuzzle.name}" has no reachable solution: {aimErr}`)
 		teardown()
 		return
 	end
-	local targetYaw: number, targetPitch: number = solYaw, solPitch
 	resolveTarget = function()
-		local y, pch = Align.solve(TUNE.anchorNear, TUNE.anchorFar, rig.distance(), math.rad(feel.pitchLimitDeg))
-		if y and pch then
-			targetYaw, targetPitch = y, pch
-		end
+		aimAtCurrent()
 	end
 
 	--------------------------------------------------------------------------------
@@ -403,31 +459,99 @@ local function startSession()
 	local proxRaw = 0
 	local commitQueued = false
 	local resetQueued = false
-	local lidPoser: ((CFrame, number) -> boolean)? = nil
-	local prizeT = 0
+	-- Whatever the CURRENT stage's mechanism animates, posed from the model's pivot every
+	-- frame. Owned by the stage, not by this file, so a second stage opens something else
+	-- instead of replaying the lid.
+	local poser: ((CFrame, number) -> boolean)? = nil
+	local finishOpen: () -> ()
 
-	local function beginReveal()
-		phase = "Revealing"
-		prizeT = 0
-		lidPoser = Feedback.lid(
+	--[[
+		Stage one's mechanism: the lid swings on its hinge and the prize rises out of the box.
+		It poses BOTH, so the whole animation is one closure the stage owns -- and it keeps
+		posing after it returns true, which is what holds the lid and prize attached to the
+		object while the player turns it in free look.
+	]]
+	local function lidMechanism(): ((CFrame, number) -> boolean)?
+		local swing = Feedback.lid(
 			stage.lid,
 			stage.lidHingeLocal,
 			stage.lidClosedLocal,
 			TUNE.lidSweepDeg,
 			TUNE.lidTime
 		)
+		local t = 0
+		local spinAngle = 0
+		return function(root: CFrame, dt: number): boolean
+			local done = swing(root, dt)
+			t = math.min(t + dt / TUNE.lidTime, 1)
+			-- Fast while it rises, then a slow idle turn that carries on through free look, so
+			-- an opened box does not read as a frozen tableau.
+			spinAngle += dt * (0.9 + 3.4 * (1 - t))
+			stage.prize.CFrame = root
+				* stage.prizeClosedLocal:Lerp(stage.prizeOpenLocal, Damp.easeOutQuint(t))
+				* CFrame.Angles(0, spinAngle, 0)
+			return done
+		end
+	end
+
+	firstPuzzle.mechanism = lidMechanism
+
+	local function beginReveal()
+		phase = "Revealing"
+		local puzzle = current
+		poser = if puzzle and puzzle.mechanism then puzzle.mechanism() else nil
 		fx.fire("solved")
 		hud.setState("OPEN")
 		hud.setHint("R to reset · Q or EXIT to leave")
+		if not poser then
+			-- A stage whose payoff is the snap itself has nothing to animate; do not sit in
+			-- Revealing waiting for a poser that will never report finished.
+			finishOpen()
+		end
+	end
+
+	--[[
+		The mechanism has finished running. Either the stage hands over a successor -- straight
+		back into Play against the new pair -- or the object is simply left turnable, which is
+		what makes authoring a later stage possible at all.
+	]]
+	function finishOpen()
+		local solved = current
+		local nextPuzzle: Puzzle? = nil
+		if solved and solved.onSolved then
+			nextPuzzle = solved.onSolved()
+		end
+
+		current = nextPuzzle
+		gate.reset()
+		prox, proxRaw = 1, 0
+
+		if nextPuzzle then
+			aimAtCurrent()
+			phase = "Play"
+			drag.setEnabled(true)
+			hud.setState("")
+			hud.setHint(`stage: {nextPuzzle.name} · drag to turn`)
+			return
+		end
+
+		phase = "Opened"
+		if TUNE.freeLookAfterOpen then
+			drag.setEnabled(true)
+			hud.setHint("free look · R to reset · Q or EXIT to leave")
+		else
+			hud.setHint("R to reset · Q or EXIT to leave")
+		end
 	end
 
 	local function resetPuzzle()
 		phase = "Settling"
 		settleFor = 0
 		prox, proxRaw = 0, 0
-		lidPoser = nil
-		prizeT = 0
+		poser = nil
 		gate.reset()
+		current = firstPuzzle
+		aimAtCurrent()
 		spin.set(TUNE.startYaw, TUNE.startPitch)
 		drag.setEnabled(false)
 		local root = stage.model:GetPivot()
@@ -465,14 +589,19 @@ local function startSession()
 
 		if resetQueued then
 			resetQueued = false
-			if phase == "Opened" or phase == "Revealing" then
+			-- Any time except mid-snap, where it would fight the one animation the player is
+			-- not driving. Handy when filming: R re-scrambles without leaving the view.
+			if phase ~= "Committing" then
 				resetPuzzle()
 			end
 		end
 
 		-- 1. input: accumulated in callbacks, consumed exactly once here
 		local f = drag.consume()
-		if phase == "Play" then
+		-- Turning is allowed while a stage is live AND during free look after the mechanism has
+		-- run. Only the committing/revealing window takes the object away from the player.
+		local canTurn = phase == "Play" or phase == "Opened"
+		if canTurn then
 			if f.dx ~= 0 or f.dy ~= 0 then
 				spin.drag(f.dx, f.dy)
 			end
@@ -487,7 +616,7 @@ local function startSession()
 		--    click at the visually perfect moment must never be refused.
 		local wantsCommit = commitQueued or f.tapped
 		commitQueued = false
-		if wantsCommit and phase == "Play" and gate.armed() then
+		if wantsCommit and phase == "Play" and current and gate.armed() then
 			phase = "Committing"
 			holdFor = 0
 			spin.freeze()
@@ -506,15 +635,10 @@ local function startSession()
 		--    PivotTo moves descendants rigidly by the frame's delta, so anything mid-animation
 		--    has to be written absolutely, and from this frame's root.
 		local root = stage.model:GetPivot()
-		if lidPoser then
-			local finished = lidPoser(root, dt)
-			prizeT = math.min(prizeT + dt / TUNE.lidTime, 1)
-			local rise = Damp.easeOutQuint(prizeT)
-			stage.prize.CFrame = root
-				* stage.prizeClosedLocal:Lerp(stage.prizeOpenLocal, rise)
-				* CFrame.Angles(0, prizeT * math.pi * 1.5, 0)
+		if poser then
+			local finished = poser(root, dt)
 			if finished and phase == "Revealing" then
-				phase = "Opened"
+				finishOpen()
 			end
 		end
 
@@ -534,12 +658,13 @@ local function startSession()
 				drag.setEnabled(true)
 				hud.setHint("drag to turn the box")
 			end
-		elseif phase == "Play" then
+		elseif phase == "Play" and current then
+			local puzzle = current :: Puzzle
 			local p = Align.probe(
 				eye,
 				look,
-				stage.nearAnchor.WorldPosition,
-				stage.farAnchor.WorldPosition,
+				puzzle.near.WorldPosition,
+				puzzle.far.WorldPosition,
 				TUNE.home.Position,
 				TUNE.subjectRadius,
 				TUNE.minDepthGap,
@@ -567,9 +692,15 @@ local function startSession()
 					else ""
 			)
 			hud.setProgress(prox, canCommit, state == "Locked")
+		elseif phase == "Opened" then
+			-- Free look. No stage is live, so nothing is scored and the glow relaxes -- but the
+			-- object still turns, and the lid and prize are still posed from the pivot every
+			-- frame, so it reads as an opened box being examined rather than a frozen tableau.
+			proxRaw = 0
+			hud.setProgress(prox, false, false)
 		else
-			-- Committing / Revealing / Opened: the snap sweeps straight through the lock band
-			-- by construction and would re-fire everything. Hold the signal lit instead.
+			-- Committing / Revealing: the snap sweeps straight through the lock band by
+			-- construction and would re-fire everything. Hold the signal lit instead.
 			proxRaw = 1
 			hud.setProgress(1, false, true)
 		end
