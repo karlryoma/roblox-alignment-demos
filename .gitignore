@@ -6,8 +6,11 @@
 /sourcemap.json
 /globalTypes.d.luau
 
-# Built place: regenerate with `rojo build -o sandbox.rbxlx`.
-# Track it instead if you start hand-building world geometry in Studio.
-/sandbox.rbxlx
+# The Studio place, in either format. The demo builds every part in code, so the place is a
+# stock Baseplate carrying nothing -- and Studio rewrites the binary on every save, which
+# would churn the history with blobs that cannot be diffed or merged.
+# Track it instead if you ever hand-build world geometry that the code does not create.
+/*.rbxl
+/*.rbxlx
 
 /.claude/settings.local.json
