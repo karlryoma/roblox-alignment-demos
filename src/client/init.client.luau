@@ -168,31 +168,51 @@ local function neutraliseLighting(): () -> ()
 end
 
 --[[
-	The character is never moved and never required through PlayerModule (which cannot be
-	resolved by luau-lsp through the sourcemap, so requiring it would fail this project's own
-	quality gate). Anchoring the root and switching the movement modes to Scriptable is the
-	typed way to say "stand still".
+	Hold the character still.
+
+	NOT via Player.DevComputerMovementMode / DevTouchMovementMode: those need the RobloxScript
+	capability and throw "The current thread cannot set 'DevComputerMovementMode'" from an
+	ordinary LocalScript, which aborts the whole session. And never via PlayerModule, which
+	luau-lsp cannot resolve through the sourcemap, so requiring it would fail this project's own
+	quality gate.
+
+	Zeroing the humanoid and anchoring the root needs no capability, is typed, and is reversible.
+	The character is never moved, so there is no pose to restore.
 ]]
 local function holdCharacter(): () -> ()
 	local undo: { () -> () } = {}
 
-	local computerMode, touchMode = player.DevComputerMovementMode, player.DevTouchMovementMode
-	player.DevComputerMovementMode = Enum.DevComputerMovementMode.Scriptable
-	player.DevTouchMovementMode = Enum.DevTouchMovementMode.Scriptable
-	table.insert(undo, function()
-		player.DevComputerMovementMode = computerMode
-		player.DevTouchMovementMode = touchMode
-	end)
-
 	local character = player.Character
-	local root = if character then character:FindFirstChild("HumanoidRootPart") else nil
-	if root and root:IsA("BasePart") and not root.Anchored then
-		root.Anchored = true
-		table.insert(undo, function()
-			if root and root.Parent then
-				root.Anchored = false
-			end
-		end)
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			local walkSpeed = humanoid.WalkSpeed
+			local jumpHeight = humanoid.JumpHeight
+			local jumpPower = humanoid.JumpPower
+			local autoRotate = humanoid.AutoRotate
+			humanoid.WalkSpeed = 0
+			humanoid.JumpHeight = 0
+			humanoid.JumpPower = 0
+			humanoid.AutoRotate = false
+			table.insert(undo, function()
+				if humanoid.Parent then
+					humanoid.WalkSpeed = walkSpeed
+					humanoid.JumpHeight = jumpHeight
+					humanoid.JumpPower = jumpPower
+					humanoid.AutoRotate = autoRotate
+				end
+			end)
+		end
+
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") and not root.Anchored then
+			root.Anchored = true
+			table.insert(undo, function()
+				if root.Parent then
+					root.Anchored = false
+				end
+			end)
+		end
 	end
 
 	return function()
@@ -229,12 +249,12 @@ local function teardown()
 	table.clear(restores)
 end
 
-local function enter()
-	if active then
-		return
-	end
-	active = true
-
+--[[
+	Everything from here to the fade-in. Wrapped by enter() below: a throw partway through
+	would otherwise leave `active` true, the camera Scriptable and the lighting neutralised,
+	with no way back -- which is exactly what an unwritable property did on the first run.
+]]
+local function startSession()
 	sessionCharacter = player.Character
 
 	local hud = Hud.new(playerGui)
@@ -578,6 +598,18 @@ local function enter()
 
 	hud.setHint("")
 	hud.fade(1, 0.45)
+end
+
+local function enter()
+	if active then
+		return
+	end
+	active = true
+	local ok, err = pcall(startSession :: () -> any)
+	if not ok then
+		warn(`[demo1] session failed to start: {err}`)
+		teardown()
+	end
 end
 
 --------------------------------------------------------------------------------
