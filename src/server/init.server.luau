@@ -1,12 +1,4 @@
 --!strict
--- Runs in ServerScriptService.Server
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
-
-local Hello = require(ReplicatedStorage.Shared.Hello)
-
-Players.PlayerAdded:Connect(function(player)
-	print("[server]", Hello.greet(player.Name))
-end)
-
-print("[server] sandbox up")
+-- Demo 1 is entirely client-side: the camera only exists per client, so the alignment test
+-- is inherently local and there is nothing here to be authoritative about.
+print("[server] alignment demo: nothing to do, the demo is client-side")

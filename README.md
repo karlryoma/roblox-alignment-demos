@@ -1,43 +1,96 @@
-# sandbox
+# Alignment demos
 
-A scratch Roblox place for trying things out. Rojo syncs code from `src/`;
-the `.rbxlx` place file owns everything physical (baseplate, parts, lighting).
+Roblox tech demos on camera/perspective alignment illusions — the Monument Valley /
+Echochrome / Superliminal / The Room family. Showcase pieces for a developer audience,
+not a shipped game: client-only, no server authority, placeholder art on purpose.
 
-## One-time setup
+**Demo 1 — Item Inspection** is built. Demos 2–4 are world-scale variants that reuse
+`src/shared` unchanged.
 
-1. `rokit install` — installs the pinned rojo / selene / luau-lsp.
-2. `rojo plugin install` — puts the Rojo plugin in Studio (once per machine).
-3. Studio: **File → New → Baseplate**, then **Save As** → `sandbox.rbxlx`
-   in this folder. It's gitignored; untrack it if you build something worth
-   keeping.
-
-## Daily loop
+## Running it
 
 ```
-rojo serve              # serves on port 34873; Studio: Rojo plugin -> Connect
-bash scripts/check.sh   # sourcemap + luau-lsp type check + selene lint
+rokit install
+rojo serve            # port 34873; Studio: Rojo plugin -> Connect
 ```
 
-Expected output on Play: `[server] sandbox up`, `[client] hello, world`.
+Studio: **File → New** (Baseplate), **Save As** `sandbox.rbxlx` here, connect, press Play.
+The demo enters itself once the character exists.
+
+```
+drag          turn the box (mouse or touch)
+click / E     engage, once the HUD says it is armed
+R             reset
+Q or EXIT     leave the inspection view
+I             re-enter
+```
+
+Not Escape — the Roblox menu owns that key, so `InputBegan` never sees it with
+`gameProcessedEvent` false.
+
+## What it does
+
+A 3-stud puzzle box turns in front of a near-orthographic camera. Two anchors sit at
+different depths inside it, collinear with the pivot. From exactly one viewing direction
+they coincide; approaching it escalates glow / hum / motes, and committing snaps to the
+exact solution and swings the lid open.
+
+## The three decisions that matter
+
+**1. `atan2`, not `acos`.** The obvious test is `acos(ua:Dot(ub))`. At FOV 1 it does not
+merely lose precision, it returns nothing at all. The lock tolerance is 0.0097°, so
+`1 - cos(0.0097°) = 1.42e-8`, against a float32 ULP at 1.0 of `1.19e-7` — and Vector3
+components are float32. Measured: at the lock threshold the float32 dot product rounds to
+exactly `1.0`, so `acos` reports `0.000000°` where `atan2(|a×b|, a·b)` in doubles reports
+`0.009665°`. `Align.selfTest()` prints both at boot.
+
+**2. Tolerance is a fraction of the subject's apparent diameter**, not degrees and not
+pixels. Degrees mean different things at FOV 1 and FOV 70; a screen fraction changes
+difficulty when the fit distance is refit for portrait. The identity
+`sepNorm = delta * L / (2r)` means the lock window *in degrees of drag* depends only on the
+object's own geometry, so the same four authored numbers give the same feel on a 200-stud
+monument in demo 3.
+
+**3. Two degrees of freedom, not three.** Roll about the eye–pivot axis is an isometry
+fixing the eye, so it preserves every angle subtended there and provably cannot solve the
+puzzle. State is `(yaw, pitch)` and the CFrame is rebuilt from scratch each frame: no
+accumulated shear, no drag-axis inversion, no locking while upside down, and the snap
+target is closed-form.
+
+A corollary worth stating: the raw lock window is ~14 mouse pixels wide — correct, and
+unhittable. That is fixed by damping the drag gain inside the band and arming the commit at
+a much wider threshold, never by loosening the tolerance. Loosening it makes the illusion
+lie.
 
 ## Layout
 
-| Path                | Becomes                                     |
-| ------------------- | ------------------------------------------- |
-| `src/shared/*.luau` | `ReplicatedStorage.Shared`                  |
-| `src/server/*.luau` | `ServerScriptService.Server`                |
-| `src/client/*.luau` | `StarterPlayer.StarterPlayerScripts.Client` |
+| File | Role |
+| --- | --- |
+| `src/shared/Align.luau` | Pure geometry: separation, probe, closed-form solve, hysteresis gate. No Instances. |
+| `src/shared/Damp.luau` | Framerate-independent smoothing. Every constant is a time constant. |
+| `src/shared/Spin.luau` | View-sphere state; one integrator for drag, coast and snap. |
+| `src/shared/Mount.luau` | The near-ortho rig. `Mount.object` (demo 1) / `Mount.orbit` (demos 2–4). |
+| `src/client/Drag.luau` | Input capture only; accumulate in callbacks, consume once per frame. |
+| `src/client/Feedback.luau` | Proximity-driven channels + the angle-driven hinged lid. |
+| `src/client/Stage.luau` | Client-built placeholder geometry. |
+| `src/client/Hud.luau` | Meter, state line, fade, exit button. |
+| `src/client/init.client.luau` | The demo: TUNE table, state machine, the single render step. |
 
-File suffix picks the instance class: `*.server.luau` → Script,
-`*.client.luau` → LocalScript, plain `*.luau` → ModuleScript. A folder with an
-`init.luau` becomes a ModuleScript with the siblings as children.
+`bash scripts/check.sh` — sourcemap + `luau-lsp analyze` + `selene`.
 
-To throw code away, just delete the file — Rojo removes the instance on sync.
+## Porting to demos 2–4
+
+Swap `Mount.object` for `Mount.orbit`: the camera then orbits and the world stays put.
+Nothing else in `src/shared` changes, because the alignment test is written in world space
+against whatever pose was actually rendered this frame — it does not care which side moved.
+Both mounts read `(yaw, pitch)` in the frame the anchors were authored in, so
+`Align.solve`'s answer is portable between them.
+
+What is demo-1-only: `Stage.luau`, and `Feedback.halo`'s world-fixed reticle rest poses
+(fine while the camera is parked, needs re-posing per frame once the camera orbits).
 
 ## WSL note
 
-This lives on `/mnt/c`, where Rojo's file watcher never fires. A `rojo serve`
-started from WSL will keep serving your source as it was when the process
-launched, no matter how many times Studio reconnects. Run `rojo serve` from
-Windows PowerShell, or restart it after each edit. Editing
-`default.project.json` always requires a restart.
+Rojo's file watcher does not fire on `/mnt/c`. A `rojo serve` started from WSL keeps serving
+the source as it was when the process launched. Run it from Windows PowerShell, or restart
+it after each edit. Editing `default.project.json` always needs a restart.
