@@ -206,7 +206,8 @@ function Align.solve(
 	nearLocal: Vector3,
 	farLocal: Vector3,
 	radius: number,
-	pitchLimit: number
+	pitchLimit: number,
+	pitchFloor: number?
 ): (number?, number?, string?)
 	local axis = nearLocal - farLocal
 	local baseline = axis.Magnitude
@@ -232,7 +233,11 @@ function Align.solve(
 	end
 
 	local yaw, pitch = Align.toSpherical(eye)
-	if math.abs(pitch) > pitchLimit then
+	-- The range is asymmetric wherever the consumer's is. A rig that clamps to [-14, +62] and
+	-- asks here for a symmetric +/-62 accepts solutions it will then silently clamp away, which
+	-- reads as "the commit was taken and the payoff pose is wrong".
+	local floor = pitchFloor or -pitchLimit
+	if pitch > pitchLimit or pitch < floor then
 		return nil, nil, string.format("solution pitch %.1f deg is outside the clamp", math.deg(pitch))
 	end
 

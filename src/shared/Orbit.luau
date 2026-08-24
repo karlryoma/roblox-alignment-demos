@@ -50,6 +50,12 @@ export type Rig = {
 	eye: () -> Vector3,
 	look: () -> Vector3,
 	focusPoint: () -> Vector3,
+	--[[ The distance the eye is ACTUALLY at. Collision pulls the boom in constantly indoors, so
+	     anything solving for a viewpoint on the orbit sphere must use this, not opts.distance. ]]
+	radius: () -> number,
+	--[[ Seed or settle the focus without a subject: needed when the demo starts during a respawn
+	     window, and to converge the focus instantly when a scripted snap begins. ]]
+	setFocus: (pos: Vector3) -> (),
 	setSubject: (part: BasePart?) -> (),
 	setFilter: (parts: { Instance }) -> (),
 	restore: () -> (),
@@ -166,6 +172,15 @@ function Orbit.new(camera: Camera, subject: BasePart?, opts: Options): Rig
 
 		focusPoint = function(): Vector3
 			return focusPos
+		end,
+
+		radius = function(): number
+			return (eyePos - focusPos).Magnitude
+		end,
+
+		setFocus = function(pos: Vector3)
+			focusPos = pos
+			eyePos = focusPos + Align.fromSpherical(yaw, pitch, opts.distance)
 		end,
 
 		setSubject = function(part: BasePart?)

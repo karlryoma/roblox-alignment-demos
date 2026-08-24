@@ -217,9 +217,15 @@ function Demo1.start(ctx: Shell.Context): boolean
 		local targetYaw, targetPitch = 0, 0
 
 		local function aim(): boolean
+			local puzzle = chain.current()
+			-- A finished chain, or a stage that does not snap, is a silent success -- not a
+			-- failure. Otherwise every ViewportSize change after the box opens warns.
+			if not puzzle or not puzzle.solve then
+				return true
+			end
 			local yaw, pitch, why = chain.aim()
 			if not yaw or not pitch then
-				warn(`[demo1] stage "{firstPuzzle.name}" has no reachable solution: {why}`)
+				warn(`[demo1] stage "{puzzle.name}" has no reachable solution: {why}`)
 				return false
 			end
 			targetYaw, targetPitch = yaw, pitch
@@ -316,13 +322,15 @@ function Demo1.start(ctx: Shell.Context): boolean
 
 		local function beginReveal()
 			phase = "Revealing"
-			local before = chain.current()
-			chain.beginMechanism()
+			local animating = chain.beginMechanism()
 			fx.fire("solved")
 			hud.setState("OPEN")
 			hud.setHint("R to reset · Q or EXIT to leave")
-			if before and not before.mechanism then
-				finishOpen() -- nothing to animate; do not wait for a poser that will never finish
+			if not animating then
+				-- Nothing to animate: do not sit in Revealing waiting on a poser that was never
+				-- added. Asking the chain is the only reliable test -- `mechanism` may exist and
+				-- still return nil.
+				finishOpen()
 			end
 		end
 
@@ -330,6 +338,9 @@ function Demo1.start(ctx: Shell.Context): boolean
 			phase = "Settling"
 			settleFor = 0
 			rawProx = 0
+			-- The gate is rebuilt by chain.reset, so the cached snapshot must go with it or a
+			-- reset taken while armed carries a stale arm into the next Play frame.
+			armed = false
 			chain.reset(firstPuzzle)
 			aim()
 			spin.set(TUNE.startYaw, TUNE.startPitch)

@@ -188,13 +188,19 @@ function Room.build(origin: CFrame, parent: Instance): Handle
 	local near1 = Vector3.new(S1_X, S1_Y, S1_HALF)
 	local far1 = Vector3.new(S1_X, S1_Y, -S1_HALF)
 	for _, at in { near1, far1 } do
+		-- canQuery FALSE, and stopping short of the marker. A rod hung from the ceiling to the
+		-- marker's own centre sits exactly on the sight line from any viewpoint above the anchor
+		-- plane -- which includes the whole final approach -- so a queryable rod makes the demo
+		-- read BLOCKED precisely as the player gets it right. It is dressing; nothing needs to
+		-- hit it, and excluding it from queries also stops it shoving the camera.
+		local gap = 0.5
 		newPart(
 			"Hanger",
-			Vector3.new(0.12, 14 - at.Y, 0.12),
-			origin * CFrame.new(at.X, (14 + at.Y) / 2, at.Z),
+			Vector3.new(0.12, 14 - at.Y - gap, 0.12),
+			origin * CFrame.new(at.X, (14 + at.Y + gap) / 2, at.Z),
 			TRIM,
 			Enum.Material.Metal,
-			true,
+			false,
 			folder
 		)
 	end
@@ -237,6 +243,13 @@ function Room.build(origin: CFrame, parent: Instance): Handle
 	local doorClosed = origin * CFrame.new(0, 4, -10.5)
 	local door = newPart("Door", Vector3.new(6, 8, 0.6), doorClosed, Color3.fromRGB(66, 71, 82), Enum.Material.Metal, true, folder)
 	local doorOpen = origin * CFrame.new(0, 12.2, -10.5)
+
+	-- The payoff hint says "the way is open", so the first thing a viewer does is walk through.
+	-- Without this the doorway opens onto a 2,000-stud drop to FallenPartsDestroyHeight.
+	newPart("Landing", Vector3.new(10, 1, 8), origin * CFrame.new(0, -0.5, -14.5), TRIM, Enum.Material.Slate, true, folder)
+	newPart("LandingRailW", Vector3.new(1, 3, 8), origin * CFrame.new(-4.5, 1.5, -14.5), SHELL, Enum.Material.Concrete, true, folder)
+	newPart("LandingRailE", Vector3.new(1, 3, 8), origin * CFrame.new(4.5, 1.5, -14.5), SHELL, Enum.Material.Concrete, true, folder)
+	newPart("LandingRailS", Vector3.new(10, 3, 1), origin * CFrame.new(0, 1.5, -18), SHELL, Enum.Material.Concrete, true, folder)
 
 	--------------------------------------------------------------------------------
 	-- motes at each marker pair

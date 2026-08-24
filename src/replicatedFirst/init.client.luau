@@ -36,6 +36,10 @@ gui.ResetOnSpawn = false
 gui.DisplayOrder = 100
 
 local backdrop = Instance.new("Frame")
+-- Active, so the boot screen SINKS clicks. Roblox routes input to the topmost INTERACTIVE
+-- element, not the topmost opaque one, so a plain Frame at DisplayOrder 100 would let a click
+-- land on the menu card underneath it.
+backdrop.Active = true
 backdrop.Size = UDim2.fromScale(1, 1)
 backdrop.BackgroundColor3 = Color3.fromRGB(9, 10, 13)
 backdrop.BorderSizePixel = 0
@@ -121,9 +125,6 @@ if remaining > 0 then
 	task.wait(remaining)
 end
 
--- The shell waits on this, with its own timeout, so a failure here cannot strand the session.
-ReplicatedFirst:SetAttribute("LoadingDone", true)
-
 TweenService:Create(backdrop, TweenInfo.new(0.4), { BackgroundTransparency = 1 }):Play()
 for _, label in { title, sub } do
 	TweenService:Create(label, TweenInfo.new(0.3), { TextTransparency = 1 }):Play()
@@ -132,3 +133,8 @@ TweenService:Create(track, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):P
 TweenService:Create(fill, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
 task.wait(0.45)
 gui:Destroy()
+
+-- Signalled AFTER the screen is gone, not before the fade: the shell shows the menu on the next
+-- frame, and handing over early leaves an interactive picker underneath a visible boot screen.
+-- The shell's own timeout covers a hang here.
+ReplicatedFirst:SetAttribute("LoadingDone", true)

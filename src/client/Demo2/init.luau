@@ -148,6 +148,11 @@ function Demo2.start(ctx: Shell.Context): boolean
 		local orbit = Orbit.new(cam, if root and root:IsA("BasePart") then root else nil, opts)
 		s.add(orbit.restore)
 		orbit.set(math.rad(180), math.rad(20))
+		-- Starting inside a respawn window is reachable: die in the lobby, click DEMO 2. With no
+		-- subject the focus would sit at the world origin, 9,000 studs from the room, and the
+		-- demo would fade up on empty space. Seed it where the respawn is going to land; the
+		-- onCharacter hook takes over the moment there is a body.
+		orbit.setFocus(room.spawnCF.Position + Vector3.new(0, TUNE.orbitHeight, 0))
 
 		-- The avatar is excluded from CAMERA collision and deliberately NOT from the anchor
 		-- occlusion test below: the body should hide the markers, but it must never shove the
@@ -370,6 +375,7 @@ function Demo2.start(ctx: Shell.Context): boolean
 		local snapT = 0
 		local fromYaw, fromPitch = 0, 0
 		local toYaw, toPitch = 0, 0
+		local refusedFor = 0
 
 		local panelOffset = 0
 		local panelLatched = false
@@ -406,7 +412,12 @@ function Demo2.start(ctx: Shell.Context): boolean
 			if phase ~= "Manipulating" or panelLatched then
 				return "orbit"
 			end
-			local ray = cam:ScreenPointToRay(pos.X, pos.Y)
+			-- ViewportPointToRay, not ScreenPointToRay: this is the documented pairing for a
+			-- point from UserInputService:GetMouseLocation (and for a touch InputObject's
+			-- Position). ScreenPointToRay offsets by the GUI inset and would be ~36 px off
+			-- vertically, which at a distance turns into a visible mis-grab near the top of
+			-- the screen.
+			local ray = cam:ViewportPointToRay(pos.X, pos.Y)
 			local hit = workspace:Raycast(ray.Origin, ray.Direction * 300, panelParams)
 			if not hit then
 				return "orbit"
@@ -420,7 +431,9 @@ function Demo2.start(ctx: Shell.Context): boolean
 			return "panel"
 		end
 
-		local drag = Drag.new(cam, hud.gui, { classify = classify })
+		-- touchHalf: the player WALKS here, so a full-screen Modal surface would sit on top of the
+		-- default thumbstick and it would never receive input at all.
+		local drag = Drag.new(cam, hud.gui, { classify = classify, touchHalf = true })
 		s.add(drag.destroy)
 		drag.setEnabled(false)
 
@@ -453,6 +466,54 @@ function Demo2.start(ctx: Shell.Context): boolean
 			freezeCharacter(false)
 		end)
 
+		--[[
+			The viewpoint that coincides the anchors, solved in the frame centred on the camera's
+			FOCUS -- but at the radius the eye is ACTUALLY at, not the nominal boom length.
+			Orbit's collision clamp pulls the eye in whenever a wall is behind the player, which
+			indoors is the normal case rather than an edge case, and solving against 13 studs
+			while sitting at 8 aims the snap at a pose the camera cannot occupy.
+
+			The pitch range is passed asymmetrically for the same reason: the rig clamps to
+			[-14, +62], so a symmetric limit would accept solutions it then silently clamps away.
+		]]
+		local function solveSnap(): (number?, number?, string?)
+			local puzzle = chain.current()
+			if not puzzle then
+				return nil, nil, "no live stage"
+			end
+			local focus = orbit.focusPoint()
+			local near, far = puzzle.anchors()
+			return Align.solve(
+				near - focus,
+				far - focus,
+				orbit.radius(),
+				math.rad(opts.maxPitchDeg),
+				math.rad(opts.minPitchDeg)
+			)
+		end
+
+		--[[ Did the snap actually land on the alignment? Checked against the ARM window, which is
+		     the same generous threshold that accepted the commit. ]]
+		local function snapLanded(): boolean
+			local puzzle = chain.current()
+			if not puzzle then
+				return false
+			end
+			local near, far = puzzle.anchors()
+			local center, radius = puzzle.sphere()
+			local p = Align.probe(
+				orbit.eye(),
+				orbit.look(),
+				near,
+				far,
+				center,
+				radius,
+				puzzle.minGap,
+				puzzle.slackFrac
+			)
+			return p.valid and p.orderOk and p.sepNorm <= puzzle.thresholds.arm
+		end
+
 		local function setPanel(offset: number)
 			panelOffset = math.clamp(offset, 0, room.panelTravel)
 			room.panel.CFrame = room.panelClosed + room.panelAxis.Unit * panelOffset
@@ -463,6 +524,7 @@ function Demo2.start(ctx: Shell.Context): boolean
 			settleFor = 0
 			armed = false
 			snapping = false
+			refusedFor = 0
 			panelLatched = false
 			chain.reset(stage1)
 			setPanel(0)
@@ -522,16 +584,27 @@ function Demo2.start(ctx: Shell.Context): boolean
 		local function beginReveal()
 			local solved = chain.current()
 			phase = "Revealing"
-			chain.beginMechanism()
+			local animating = chain.beginMechanism()
 			fx.fire("solved")
 			hud.setState("ENGAGED")
-			if solved and not solved.mechanism then
+			if not animating then
+				-- `mechanism` may exist and still return nil, so the chain's own answer is the
+				-- only reliable test for "there is nothing to wait on".
 				if solved == stage1 then
 					afterStage1()
 				else
 					afterStage2()
 				end
 			end
+		end
+
+		local function refuseCommit(why: string)
+			warn(`[demo2] commit refused: {why}`)
+			refusedFor = 1.4
+			freezeCharacter(false)
+			snapping = false
+			phase = "Play"
+			drag.setEnabled(true)
 		end
 
 		--------------------------------------------------------------------------------
@@ -550,36 +623,49 @@ function Demo2.start(ctx: Shell.Context): boolean
 
 			-- 1. input, consumed exactly once
 			local f = drag.consume()
-			local canOrbit = phase ~= "Committing"
-			if f.mode == "panel" and phase == "Manipulating" and not panelLatched then
-				if f.held then
-					local ray = cam:ScreenPointToRay(f.pos.X, f.pos.Y)
-					local param = axisParam(ray.Origin, ray.Direction)
-					if param then
-						setPanel(grabOffset + (param - grabParam))
-					end
-				end
-				if panelOffset >= room.panelTravel * TUNE.panelOpenFraction then
-					panelLatched = true
-					setPanel(room.panelTravel)
-					phase = "Play"
-					hud.setState("")
-					hud.setHint("a second pair is exposed")
+			-- `mode` is decided on press and stays put until the next one, so it is only
+			-- authoritative while the button is DOWN. Gating on held as well is what stops a
+			-- press that began on the panel from spinning the camera once the panel latches --
+			-- and stops a released panel press from blocking the camera forever.
+			local panelPress = f.mode == "panel" and f.held
+			local canOrbit = phase ~= "Committing" and not panelPress
+
+			if panelPress and phase == "Manipulating" and not panelLatched then
+				local ray = cam:ViewportPointToRay(f.pos.X, f.pos.Y)
+				local param = axisParam(ray.Origin, ray.Direction)
+				if param then
+					setPanel(grabOffset + (param - grabParam))
 				end
 			elseif canOrbit and (f.dx ~= 0 or f.dy ~= 0) then
 				orbit.turn(f.dx, f.dy)
+			end
+
+			-- Checked every frame in this phase, not only while dragging: releasing exactly past
+			-- the threshold must still latch.
+			if phase == "Manipulating" and not panelLatched and panelOffset >= room.panelTravel * TUNE.panelOpenFraction then
+				panelLatched = true
+				setPanel(room.panelTravel)
+				phase = "Play"
+				hud.setState("")
+				hud.setHint("a second pair is exposed")
 			end
 
 			-- 2. commit, accepted at the ARM threshold and never at the lock threshold
 			local wantsCommit = commitQueued or (f.tapped and f.mode ~= "panel")
 			commitQueued = false
 			if wantsCommit and phase == "Play" and chain.current() and armed then
-				local puzzle = chain.current()
-				-- The snap target is solved in the frame centred on the CAMERA'S FOCUS, at the
-				-- orbit radius: that is the sphere the eye actually lives on.
-				local focus = orbit.focusPoint()
-				local near, far = (puzzle :: Chain.Puzzle).anchors()
-				local yaw, pitch, why = Align.solve(near - focus, far - focus, TUNE.orbitDistance, math.rad(opts.maxPitchDeg))
+				-- Freeze FIRST, then converge the focus onto the frozen body. The focus chases the
+				-- root with a 0.12 s time constant, so a player who commits while still walking is
+				-- ~2 studs behind it -- and the snap would be solved in a frame that keeps moving
+				-- underneath the animation.
+				freezeCharacter(true)
+				local body = ctx.player.Character
+				local bodyRoot = if body then body:FindFirstChild("HumanoidRootPart") else nil
+				if bodyRoot and bodyRoot:IsA("BasePart") then
+					orbit.setFocus(bodyRoot.Position + Vector3.new(0, TUNE.orbitHeight, 0))
+				end
+
+				local yaw, pitch, why = solveSnap()
 				if yaw and pitch then
 					fromYaw, fromPitch = orbit.get()
 					toYaw, toPitch = yaw, pitch
@@ -587,30 +673,42 @@ function Demo2.start(ctx: Shell.Context): boolean
 					snapping = true
 					phase = "Committing"
 					holdFor = 0
-					freezeCharacter(true)
 					drag.setEnabled(false)
 					hud.setState("ENGAGING")
 				else
-					-- Loud rather than silent: a refused commit with no explanation is the worst
-					-- possible feel.
-					warn(`[demo2] commit refused, no reachable snap from here: {why}`)
-					hud.setState("MOVE CLOSER")
+					refuseCommit(why or "no reachable viewpoint from here")
 				end
 			end
 
 			-- 3. camera
 			if snapping then
+				-- Re-solved every frame: the collision clamp changes the boom length as the
+				-- direction sweeps, so a target fixed at press time drifts off the anchor line
+				-- during its own animation.
+				local reYaw, rePitch = solveSnap()
+				if reYaw and rePitch then
+					toYaw, toPitch = reYaw, rePitch
+				end
 				snapT += dt
 				local t = math.clamp(snapT / TUNE.snapTime, 0, 1)
 				local e = Damp.easeOutQuint(t)
 				orbit.set(fromYaw + Damp.shortestArc(fromYaw, toYaw) * e, fromPitch + (toPitch - fromPitch) * e)
 				if t >= 1 then
 					snapping = false
-					holdFor = 0.0001
 				end
 			end
 			orbit.step(dt)
 			eyeNow = orbit.eye()
+
+			-- Verified against the pose that was actually RENDERED, after the clamp has had its
+			-- say. The mechanism must never fire on a viewpoint that does not show the illusion.
+			if phase == "Committing" and not snapping and holdFor <= 0 then
+				if snapLanded() then
+					holdFor = 0.0001
+				else
+					refuseCommit("the snapped viewpoint is blocked or clamped short")
+				end
+			end
 
 			-- 4. mechanisms: every poser, every frame, forever. Nothing here pivots, so an
 			--    abandoned poser would simply freeze its part mid-slide.
@@ -641,7 +739,10 @@ function Demo2.start(ctx: Shell.Context): boolean
 				if score.enteredLocked then
 					fx.fire("locked")
 				end
-				if score.eyeInside then
+				if refusedFor > 0 then
+					refusedFor -= dt
+					hud.setState("MOVE CLOSER")
+				elseif score.eyeInside then
 					-- Asserted every frame. Align fails closed on it, but the player needs to be
 					-- told why the markers went quiet.
 					hud.setState("STEP BACK")
@@ -651,6 +752,11 @@ function Demo2.start(ctx: Shell.Context): boolean
 					end
 				elseif score.occluded then
 					hud.setState("BLOCKED")
+				elseif not score.orderOk then
+					-- The antipode shows a picture-perfect overlap and scores nothing, because the
+					-- authored near anchor is the far one from there. Without this line the meter
+					-- just sits dead and the player has no idea why.
+					hud.setState("WRONG SIDE")
 				else
 					hud.setState(
 						if score.state == "Locked" and armed

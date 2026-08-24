@@ -55,6 +55,11 @@ export type Frame = {
 
 export type Options = {
 	classify: ((pos: Vector2) -> string)?,
+	--[[ For demos where the player WALKS. A full-screen Modal surface sits on top of the default
+	     touch controls, so the thumbstick and jump button never receive input at all. With this
+	     set the surface takes the right half only and drops Modal, which is the standard mobile
+	     split: left thumb moves, right thumb looks. ]]
+	touchHalf: boolean?,
 }
 
 export type Handle = {
@@ -69,14 +74,17 @@ local TAP_TRAVEL = 0.006 -- fraction of viewport height
 
 function Drag.new(camera: Camera, parentGui: Instance, options: Options?): Handle
 	local classify = if options then options.classify else nil
+	local touchHalf = if options then options.touchHalf == true else false
+	local splitTouch = touchHalf and UserInputService.TouchEnabled
 	local surface = Instance.new("TextButton")
 	surface.Name = "DragSurface"
-	surface.Size = UDim2.fromScale(1, 1)
+	surface.Size = if splitTouch then UDim2.fromScale(0.5, 1) else UDim2.fromScale(1, 1)
+	surface.Position = if splitTouch then UDim2.fromScale(0.5, 0) else UDim2.fromScale(0, 0)
 	surface.BackgroundTransparency = 1
 	surface.Text = ""
 	surface.AutoButtonColor = false
 	surface.Active = true
-	surface.Modal = UserInputService.TouchEnabled
+	surface.Modal = UserInputService.TouchEnabled and not touchHalf
 	surface.ZIndex = 0
 	surface.Parent = parentGui
 
@@ -251,7 +259,7 @@ function Drag.new(camera: Camera, parentGui: Instance, options: Options?): Handl
 		setEnabled = function(on: boolean)
 			enabled = on
 			surface.Active = on
-			surface.Modal = on and UserInputService.TouchEnabled
+			surface.Modal = on and UserInputService.TouchEnabled and not touchHalf
 			if not on then
 				endDrag(false)
 				pendX, pendY = 0, 0

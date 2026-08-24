@@ -54,7 +54,8 @@ loosening the tolerance. Loosening it makes the illusion lie.
 <!-- GIF: demo2.gif -->
 
 Walk with WASD · drag to orbit · click or `E` to engage when armed · drag the panel ·
-`R` reset · `Q` leave.
+`R` reset · `Q` leave. On touch the capture surface takes the right half of the screen
+only, so the default thumbstick still works.
 
 Alignment does not spawn or move anything here — it **gates an interaction**. Nothing
 teleports and no geometry appears, so nothing can look wrong from an off angle. The chain

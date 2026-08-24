@@ -84,6 +84,12 @@ export type Score = {
 	eyeInside: boolean,
 	occluded: boolean,
 	subtendDeg: number,
+	--[[ Carried through from probe so a demo can SAY why it is not scoring. Without these the
+	     depth-order rejection is invisible: standing at the antipode shows a picture-perfect
+	     overlap and a dead meter, with nothing on screen explaining it. ]]
+	orderOk: boolean,
+	inFront: boolean,
+	depthGap: number,
 }
 
 export type Runner = {
@@ -95,7 +101,10 @@ export type Runner = {
 	relax: (dt: number) -> number,
 	prox: () -> number,
 	aim: () -> (number?, number?, string?),
-	beginMechanism: () -> (),
+	--[[ Returns whether a poser was actually added: `mechanism` is optional twice over (the
+	     field may be nil, and the function may return nil), and without this the caller cannot
+	     tell "no animation, finish now" from "animating". ]]
+	beginMechanism: () -> boolean,
 	pose: (root: CFrame, dt: number) -> boolean,
 	advance: () -> (Puzzle?, string?),
 	clearPosers: () -> (),
@@ -130,6 +139,7 @@ function Chain.new(first: Puzzle?): Runner
 	local currentPuzzle: Puzzle? = first
 	local gate: Align.Gate? = nil
 	local posers: { Poser } = {}
+	local newestIndex: number? = nil
 	local smoothed = 0
 
 	local function rebuildGate()
@@ -155,6 +165,9 @@ function Chain.new(first: Puzzle?): Runner
 			eyeInside = false,
 			occluded = false,
 			subtendDeg = 0,
+			orderOk = false,
+			inFront = false,
+			depthGap = 0,
 		}
 	end
 
@@ -204,6 +217,9 @@ function Chain.new(first: Puzzle?): Runner
 				eyeInside = p.eyeInside,
 				occluded = occluded,
 				subtendDeg = p.subtendDeg,
+				orderOk = p.orderOk,
+				inFront = p.inFront,
+				depthGap = p.depthGap,
 			}
 		end,
 
@@ -229,15 +245,19 @@ function Chain.new(first: Puzzle?): Runner
 			return puzzle.solve()
 		end,
 
-		beginMechanism = function()
+		beginMechanism = function(): boolean
+			newestIndex = nil
 			local puzzle = currentPuzzle
 			if not puzzle or not puzzle.mechanism then
-				return
+				return false
 			end
 			local poser = puzzle.mechanism()
-			if poser then
-				table.insert(posers, poser)
+			if not poser then
+				return false
 			end
+			table.insert(posers, poser)
+			newestIndex = #posers
+			return true
 		end,
 
 		--[[ Every poser runs every frame, forever. Returns whether the most recently added one
@@ -246,7 +266,9 @@ function Chain.new(first: Puzzle?): Runner
 			local newestDone = false
 			for i, poser in posers do
 				local done = poser(root, dt)
-				if i == #posers then
+				-- Only the poser THIS stage added may report done. Otherwise a stage with no
+				-- mechanism inherits the previous stage's finished poser and advances instantly.
+				if newestIndex and i == newestIndex then
 					newestDone = done
 				end
 			end
@@ -276,11 +298,13 @@ function Chain.new(first: Puzzle?): Runner
 
 		clearPosers = function()
 			table.clear(posers)
+			newestIndex = nil
 		end,
 
 		reset = function(firstAgain: Puzzle?)
 			currentPuzzle = firstAgain
 			table.clear(posers)
+			newestIndex = nil
 			smoothed = 0
 			rebuildGate()
 		end,
