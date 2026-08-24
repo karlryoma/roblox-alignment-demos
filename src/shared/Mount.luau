@@ -131,6 +131,9 @@ function Mount.object(
 			local localEye = Align.fromSpherical(yaw, pitch, 1)
 			local r = worldFrame * frameFor(-localEye):Inverse()
 			model:PivotTo(CFrame.new(center) * r)
+			-- Re-parked every frame rather than once at construction: a respawn hands CameraType
+			-- back to the default scripts, and a camera written only at start-up never recovers.
+			park()
 		end,
 
 		eye = function(): Vector3

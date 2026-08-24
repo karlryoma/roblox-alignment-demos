@@ -37,6 +37,8 @@ export type Probe = {
 	orderOk: boolean, -- the authored near anchor really is nearer, by at least minGap
 	inFront: boolean, -- both anchors are in front of the eye
 	depthGap: number, -- studs
+	subtendDeg: number, -- the subject's apparent diameter: the denominator of sepNorm
+	eyeInside: boolean, -- the eye is inside the subject sphere, which invalidates the unit
 	valid: boolean, -- false => sepDeg has been forced to 180
 }
 
@@ -117,8 +119,13 @@ function Align.probe(
 	local depthGap = dFar - dNear
 	local orderOk = depthGap >= minGap
 
+	-- subtendDeg returns 180 when the eye is INSIDE the subject sphere. That must fail closed:
+	-- otherwise sepNorm silently becomes sepDeg/180, the tolerance stops meaning anything the
+	-- author wrote, and the demo still looks plausible while responding to nothing. A walking
+	-- player reaches the inside of a badly chosen sphere within seconds.
 	local subtend = Align.subtendDeg(eye, center, radius)
-	local valid = inFront and subtend > EPS and dNear > EPS and dFar > EPS
+	local eyeInside = subtend >= 180
+	local valid = inFront and subtend > EPS and not eyeInside and dNear > EPS and dFar > EPS
 
 	if not valid then
 		return {
@@ -127,6 +134,8 @@ function Align.probe(
 			orderOk = orderOk,
 			inFront = inFront,
 			depthGap = depthGap,
+			subtendDeg = subtend,
+			eyeInside = eyeInside,
 			valid = false,
 		}
 	end
@@ -138,6 +147,8 @@ function Align.probe(
 		orderOk = orderOk,
 		inFront = inFront,
 		depthGap = depthGap,
+		subtendDeg = subtend,
+		eyeInside = false,
 		valid = true,
 	}
 end

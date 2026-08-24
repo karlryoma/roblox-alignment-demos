@@ -1,125 +1,41 @@
 --!strict
 --[[
-	ALIGNMENT DEMO 1 — ITEM INSPECTION
-	==================================
+	SHELL — the only LocalScript in this tree, and the owner of everything global.
 
-	A puzzle box turned in front of a near-orthographic camera. Two authored anchors sit at
-	different depths inside it; from exactly one viewing direction they coincide, and
-	committing there opens the box.
+	It hosts demos; it does not implement one. The rule it exists to enforce is that a demo may
+	not own shared state: the RenderStep bind namespace, the mouse, the camera's type and
+	subject, Lighting, and the character's whereabouts after a respawn are all shared across
+	demos and across menu round-trips, so exactly one owner takes them and hands out leases.
 
-	This file is the demo, not a library, and it is the ONLY place a render step is bound.
-	Everything above it in src/shared is reusable as-is by the world-scale demos: there, the
-	camera orbits and the world stays put, which is one line — Mount.orbit instead of
-	Mount.object. The alignment test does not change at all, because it is written in world
-	space against whatever pose was actually rendered this frame.
+	Three of those are here because of specific failures rather than tidiness:
 
-	THE THREE THINGS THAT MAKE IT WORK
-	----------------------------------
-	1. atan2, not acos. At FOV 1 the lock threshold is 0.0097 degrees, and 1 - cos(0.0097 deg)
-	   is 1.42e-8 against a float32 ULP of 1.19e-7 — the whole tolerance sits below one
-	   representable step of the cosine. acos would report a flat zero for everything inside
-	   ~0.028 degrees. See the header of Align.luau; Align.selfTest() prints the comparison at
-	   boot so nobody has to take it on faith.
-
-	2. The tolerance is a fraction of the subject's own apparent diameter (sepNorm), not
-	   degrees and not pixels. Degrees mean different things at FOV 1 and FOV 70; a screen
-	   fraction silently changes difficulty when the fit distance is refit for portrait. The
-	   identity sepNorm = delta * L / (2r) means the lock window in DEGREES OF DRAG depends
-	   only on the object's own geometry, so the same four authored numbers give the same feel
-	   on a 200-stud monument in demo 3.
-
-	3. The raw lock window is about 14 mouse pixels wide — correct, and unhittable. It is
-	   fixed by damping the drag gain inside the band and by arming the commit at a much wider
-	   threshold, never by loosening the tolerance. Loosening the tolerance makes the illusion
-	   lie, which is the one thing this demo cannot afford.
-
-	CONTROLS   drag to turn · click or E to engage when armed · R to reset · Q or the EXIT
-	           button to leave · I to re-enter
-
-	           Not Escape: the Roblox menu owns that key, so InputBegan never sees it with
-	           gameProcessedEvent false. The on-screen EXIT button is the only exit a touch
-	           player can reach at all.
+	  * MOUSE. Drag only restores MouseBehavior/MouseIconEnabled on the path that began the
+	    drag, so a demo torn down mid-drag would leave a locked, invisible cursor in the menu.
+	    Restored unconditionally on every exit.
+	  * CAMERA SUBJECT. Mount sets CameraSubject = nil and deliberately does not restore it,
+	    because demo 1 always exited via respawn. Leaving a demo through the MENU means no
+	    respawn, so CameraType goes back to Custom with nothing to follow and the camera sits
+	    where it was. Reassigned on every exit.
+	  * BIND NAMES. One global namespace; a second demo reusing a string silently unbinds the
+	    first with no warning. Claimed through Shell.claimBind, which throws on collision.
 ]]
 
 local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local SoundService = game:GetService("SoundService")
+local StarterGui = game:GetService("StarterGui")
 local UserInputService = game:GetService("UserInputService")
 
 ReplicatedStorage:WaitForChild("Shared")
-local Align = require(ReplicatedStorage.Shared.Align)
-local Damp = require(ReplicatedStorage.Shared.Damp)
-local Mount = require(ReplicatedStorage.Shared.Mount)
-local Spin = require(ReplicatedStorage.Shared.Spin)
+local Shell = require(ReplicatedStorage.Shared.Shell)
 
-local Drag = require(script.Drag)
-local Feedback = require(script.Feedback)
-local Hud = require(script.Hud)
-local Stage = require(script.Stage)
+local Menu = require(script.Menu)
+local Demo1 = require(script.Demo1)
+local Demo2 = require(script.Demo2)
 
---[[
-	Every puzzle and feel number lives here. No magic constants below this table.
-
-	The four thresholds are authored as the drag window you want to FEEL and converted once:
-	sepNorm = delta_rad * L / (2r), with L = 1.8 (anchor baseline) and r = 2.6 (circumradius),
-	so 2r/L = 2.8889 and sepNorm = delta_rad / 2.8889.
-
-	  onset  20.0 deg of drag -> 0.12083   feedback begins
-	  arm     6.0 deg         -> 0.03625   commit is accepted
-	  enter   2.0 deg         -> 0.01208   LOCK / full glow
-	  exit    3.2 deg         -> 0.01933   lock releases (1.6x hysteresis)
-]]
-local TUNE = {
-	home = CFrame.new(0, 500, 0), -- the stage sits out of sight above spawn
-	subjectRadius = 2.6, -- circumradius of a 3-stud cube: 1.5 * sqrt(3). NOT the half-extent.
-	frameMargin = 1.25, -- the subject spans 1/1.25 = 80% of the short viewport axis
-	fovDeg = 1,
-
-	anchorNear = Vector3.new(0, 0, 0.9), -- collinear with the pivot, so the solve is closed-form
-	anchorFar = Vector3.new(0, 0, -0.9), -- baseline L = 1.8
-	-- Containment slack, in the same normalised unit as the thresholds below, subtracted after
-	-- the division so it survives a change of rig. 0 keeps the mechanism exact. The honest
-	-- value for this art is (ringInner - pipRadius)/distance / subtend =
-	-- (0.13 - 0.06)/372.4 rad = 0.01077 deg / 0.8 deg = 0.01346, which would slightly more
-	-- than double the lock window. The ring and pip are sized so the eye and the mechanism
-	-- already agree without it.
-	anchorSlackFrac = 0,
-	minDepthGap = 0.9, -- half the baseline; a near-co-depth authoring mistake fails loudly
-
-	bandFrac = 0.12083,
-	armFrac = 0.03625,
-	enterFrac = 0.01208,
-	exitFrac = 0.01933,
-
-	gamma = 2.2, -- back-loads the drama: halfway in reads as a faint shimmer
-	attackTau = 0.05, -- fast in: the signal reads as caused by the player
-	releaseTau = 0.22, -- slow out: no strobing at the boundary, and it leaves a trail
-	dwell = 0.08, -- armed for this long before the prompt appears
-
-	startYaw = math.rad(122),
-	startPitch = math.rad(34),
-
-	settleTime = 0.35, -- scoring is suspended until the rig stops moving
-	postSnapHold = 0.12, -- stillness after the snap, so the reveal reads as caused by it
-	-- Keep the object turnable once the mechanism has run. Off = it stays locked at the
-	-- solved pose until R. On = free look, which is also what lets a second stage be authored
-	-- against whatever the reveal exposed.
-	freeLookAfterOpen = true,
-	lidSweepDeg = 104,
-	lidTime = 0.75,
-	prizeRise = 0.9,
-
-	humAssetId = "", -- paste a looping hum here; empty means the demo runs silently
-	humMaxVolume = 0.35,
-	humLoPitch = 0.86,
-	moteMaxRate = 55,
-	burstCount = 42,
-	haloTravel = 0.55,
-}
-
-local BIND = "AlignmentDemo1"
+local LOBBY = CFrame.new(0, 6, 24)
+local BOOT_TIMEOUT = 12
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -132,642 +48,227 @@ end
 local cam: Camera = camera
 
 --------------------------------------------------------------------------------
--- scene hazards
+-- capability probes
+--
+-- globalTypes.d.luau carries no security annotations, so luau-lsp will NEVER catch a
+-- capability-gated write: it type-checks clean and throws at runtime. Every such write goes
+-- through here, and the boot probe says out loud whether it took.
 --------------------------------------------------------------------------------
 
---[[
-	Depth of field, atmosphere and fog are all distance-driven, and the subject is 372 studs
-	away. Left alone they wash it out completely. Snapshot, neutralise, restore.
-]]
-local function neutraliseLighting(): () -> ()
-	local undo: { () -> () } = {}
-
-	for _, inst in Lighting:GetDescendants() do
-		if inst:IsA("DepthOfFieldEffect") and inst.Enabled then
-			inst.Enabled = false
-			table.insert(undo, function()
-				inst.Enabled = true
-			end)
-		elseif inst:IsA("Atmosphere") then
-			local density, haze = inst.Density, inst.Haze
-			inst.Density, inst.Haze = 0, 0
-			table.insert(undo, function()
-				inst.Density, inst.Haze = density, haze
-			end)
-		end
-	end
-
-	local fogEnd, fogStart = Lighting.FogEnd, Lighting.FogStart
-	Lighting.FogEnd = 1e6
-	Lighting.FogStart = 1e6
-	table.insert(undo, function()
-		Lighting.FogEnd, Lighting.FogStart = fogEnd, fogStart
-	end)
-
-	return function()
-		for _, fn in undo do
-			fn()
-		end
-	end
-end
-
---[[
-	Hold the character still.
-
-	NOT via Player.DevComputerMovementMode / DevTouchMovementMode: those need the RobloxScript
-	capability and throw "The current thread cannot set 'DevComputerMovementMode'" from an
-	ordinary LocalScript, which aborts the whole session. And never via PlayerModule, which
-	luau-lsp cannot resolve through the sourcemap, so requiring it would fail this project's own
-	quality gate.
-
-	Zeroing the humanoid and anchoring the root needs no capability, is typed, and is reversible.
-	The character is never moved, so there is no pose to restore.
-]]
-local function holdCharacter(): () -> ()
-	local undo: { () -> () } = {}
-
-	local character = player.Character
-	if character then
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		if humanoid then
-			local walkSpeed = humanoid.WalkSpeed
-			local jumpHeight = humanoid.JumpHeight
-			local jumpPower = humanoid.JumpPower
-			local autoRotate = humanoid.AutoRotate
-			humanoid.WalkSpeed = 0
-			humanoid.JumpHeight = 0
-			humanoid.JumpPower = 0
-			humanoid.AutoRotate = false
-			table.insert(undo, function()
-				if humanoid.Parent then
-					humanoid.WalkSpeed = walkSpeed
-					humanoid.JumpHeight = jumpHeight
-					humanoid.JumpPower = jumpPower
-					humanoid.AutoRotate = autoRotate
-				end
-			end)
-		end
-
-		local root = character:FindFirstChild("HumanoidRootPart")
-		if root and root:IsA("BasePart") and not root.Anchored then
-			root.Anchored = true
-			table.insert(undo, function()
-				if root.Parent then
-					root.Anchored = false
-				end
-			end)
-		end
-	end
-
-	return function()
-		for _, fn in undo do
-			fn()
-		end
-	end
-end
-
---------------------------------------------------------------------------------
--- session
---------------------------------------------------------------------------------
-
-local active = false
-local restores: { () -> () } = {}
-local sessionCharacter: Model? = nil
-local exitSession: (() -> ())? = nil
-
---[[ Idempotent, and called from every exit path including the error path. ]]
-local function teardown()
-	if not active then
-		return
-	end
-	active = false
-	exitSession = nil
-	sessionCharacter = nil
-	for i = #restores, 1, -1 do
-		-- typed pcall needs a return type to hand back the error string
-		local ok, err = pcall(restores[i] :: () -> any)
-		if not ok then
-			warn(`[demo1] teardown step failed: {err}`)
-		end
-	end
-	table.clear(restores)
-end
-
---[[
-	Everything from here to the fade-in. Wrapped by enter() below: a throw partway through
-	would otherwise leave `active` true, the camera Scriptable and the lighting neutralised,
-	with no way back -- which is exactly what an unwritable property did on the first run.
-]]
-local function startSession()
-	sessionCharacter = player.Character
-
-	local hud = Hud.new(playerGui)
-	table.insert(restores, hud.destroy)
-	hud.fade(0, 0) -- start black; the entry is a cut, never a dolly zoom from FOV 70
-
-	table.insert(restores, neutraliseLighting())
-	table.insert(restores, holdCharacter())
-
-	local stage = Stage.build(TUNE.home, workspace)
-	table.insert(restores, stage.destroy)
-
-	local rig = Mount.object(stage.model, TUNE.home, cam, TUNE.subjectRadius, TUNE.frameMargin, TUNE.fovDeg)
-	table.insert(restores, rig.restore)
-
-	local resolveTarget: (() -> ())? = nil
-	local viewportConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-		rig.refit()
-		-- The fit distance moved, and with off-pivot anchors the solved direction moves with
-		-- it. Free for this demo (the anchors are collinear with the pivot, so the answer is
-		-- distance-independent) and correct for anyone who authors them elsewhere.
-		if resolveTarget then
-			resolveTarget()
-		end
-	end)
-	table.insert(restores, function()
-		viewportConn:Disconnect()
-	end)
-
-	local drag = Drag.new(cam, hud.gui)
-	table.insert(restores, drag.destroy)
-	-- Off until the rig has settled. Leaving it live would grab the cursor and hide the mouse
-	-- icon for 350 ms while the input is being discarded anyway.
-	drag.setEnabled(false)
-
-	-- A cushioned exit: the entry was a cut, but leaving on a hard cut reads as a crash.
-	local exiting = false
-	local function doExit()
-		if not active or exiting then
-			return
-		end
-		exiting = true
-		drag.setEnabled(false)
-		hud.fade(0, 0.25)
-		task.delay(0.25, teardown)
-	end
-	exitSession = doExit
-	hud.exitButton.Activated:Connect(doExit)
-
-	local feel = Spin.defaults()
-	local spin = Spin.new(TUNE.startYaw, TUNE.startPitch, feel)
-	local gate = Align.newGate(TUNE.enterFrac, TUNE.exitFrac, TUNE.armFrac, TUNE.bandFrac, TUNE.dwell)
-
-	--------------------------------------------------------------------------------
-	-- STAGES
-	--
-	-- A stage is an anchor PAIR plus what happens when it is solved. Return another Puzzle
-	-- from onSolved and the object chains straight into it: the box stays turnable after the
-	-- lid opens, so the next alignment can be authored against whatever the reveal exposed.
-	-- Return nil and the demo settles into free look.
-	--
-	--     local core: Puzzle = {
-	--         name = "core",
-	--         near = stage.coreNear,               -- Attachments, read live as WorldPosition
-	--         far = stage.coreFar,
-	--         nearLocal = Vector3.new(0, 0.4, 0.55),  -- the SAME points in the model's frame
-	--         farLocal = Vector3.new(0, 0.4, -0.55),
-	--         mechanism = function() return myPoser() end,   -- or nil: the snap is the payoff
-	--         onSolved = nil,
-	--     }
-	--     -- then on the first stage:  onSolved = function() return core end
-	--
-	-- nearLocal/farLocal are what the closed-form solve runs on. They must be the attachments'
-	-- own local positions, or the snap will aim at a pose where the anchors do not coincide.
-	-- The solved pose is always DERIVED, never authored: two sources of truth disagreeing by a
-	-- fraction of a degree is exactly the jank that would sink this.
-	--------------------------------------------------------------------------------
-	type Puzzle = {
-		name: string,
-		near: Attachment,
-		far: Attachment,
-		nearLocal: Vector3,
-		farLocal: Vector3,
-		-- Runs once on commit, after the snap. Return a per-frame poser (rootCF, dt) -> done
-		-- for whatever this stage opens, or nil for a stage whose payoff is the snap itself.
-		-- It keeps being called after it reports done, so it also holds its parts attached
-		-- while the object is turned afterwards.
-		mechanism: (() -> ((CFrame, number) -> boolean)?)?,
-		onSolved: (() -> Puzzle?)?,
-	}
-
-	local firstPuzzle: Puzzle = {
-		name = "lid",
-		near = stage.nearAnchor,
-		far = stage.farAnchor,
-		nearLocal = TUNE.anchorNear,
-		farLocal = TUNE.anchorFar,
-		mechanism = nil, -- assigned below: lidMechanism is declared with the other posers
-		onSolved = nil,
-	}
-	local current: Puzzle? = firstPuzzle
-
-	local targetYaw, targetPitch = 0, 0
-
-	local function aimAtCurrent(): (boolean, string?)
-		local puzzle = current
-		if not puzzle then
-			return true, nil
-		end
-		local y, pch, why = Align.solve(puzzle.nearLocal, puzzle.farLocal, rig.distance(), math.rad(feel.pitchLimitDeg))
-		if not y or not pch then
-			return false, why
-		end
-		targetYaw, targetPitch = y, pch
-		return true, nil
-	end
-
-	local aimed, aimErr = aimAtCurrent()
-	if not aimed then
-		warn(`[demo1] stage "{firstPuzzle.name}" has no reachable solution: {aimErr}`)
-		teardown()
-		return
-	end
-	resolveTarget = function()
-		aimAtCurrent()
-	end
-
-	--------------------------------------------------------------------------------
-	-- boot assertions: what a developer reading this actually wants printed
-	--------------------------------------------------------------------------------
-	local subtend = Align.subtendDeg(rig.eye(), TUNE.home.Position, TUNE.subjectRadius)
-	local baseline = (TUNE.anchorNear - TUNE.anchorFar).Magnitude
-	local dragDegFor = function(frac: number): number
-		return math.deg(frac * (2 * TUNE.subjectRadius) / baseline)
-	end
-	local pixelsFor = function(frac: number): number
-		return frac * subtend * cam.ViewportSize.Y / cam.FieldOfView
-	end
-	print(("[demo1] %s"):format(Align.selfTest()))
-	print(
-		("[demo1] rig: fov %.2f deg, distance %.1f studs, subject subtends %.4f deg"):format(
-			cam.FieldOfView,
-			rig.distance(),
-			subtend
-		)
-	)
-	print(
-		("[demo1] lock: %.2f deg of drag (%.0f screen px) · arm: %.2f deg of drag (%.0f px)"):format(
-			dragDegFor(TUNE.enterFrac),
-			pixelsFor(TUNE.enterFrac),
-			dragDegFor(TUNE.armFrac),
-			pixelsFor(TUNE.armFrac)
-		)
-	)
-
-	--------------------------------------------------------------------------------
-	-- feedback channels
-	--------------------------------------------------------------------------------
-	local fx = Feedback.new()
-	table.insert(restores, fx.destroy)
-
-	local hum: Sound? = nil
-	if TUNE.humAssetId ~= "" then
-		local s = Instance.new("Sound")
-		s.SoundId = TUNE.humAssetId
-		s.Looped = true
-		s.Volume = 0
-		s.Parent = SoundService -- 2D: a spatial sound 372 studs from the listener is inaudible
-		hum = s
-		table.insert(restores, function()
-			s:Stop()
-			s:Destroy()
-		end)
-	end
-
-	fx.add(Feedback.glow(stage.glowParts, Stage.COLD, Stage.HOT, stage.glowLight))
-	fx.add(Feedback.hum(hum, TUNE.humLoPitch, TUNE.humMaxVolume))
-	fx.add(Feedback.motes(stage.emitters, TUNE.moteMaxRate))
-	fx.add(Feedback.halo(stage.haloParts, stage.haloRest, TUNE.haloTravel))
-
-	local pulseChannel, pulse = Feedback.pulse(stage.glowParts, Color3.new(1, 1, 1), 0.22)
-	fx.add(pulseChannel) -- added after glow, so it wins for the length of its window
-	local burst = Feedback.burst(stage.emitters, TUNE.burstCount)
-	fx.on("locked", pulse)
-	fx.on("solved", function()
-		pulse()
-		burst()
-	end)
-
-	--------------------------------------------------------------------------------
-	-- state
-	--------------------------------------------------------------------------------
-	type Phase = "Settling" | "Play" | "Committing" | "Revealing" | "Opened"
-	local phase: Phase = "Settling"
-	local settleFor = 0
-	local holdFor = 0
-	local prox = 0
-	local proxRaw = 0
-	local commitQueued = false
-	local resetQueued = false
-	-- Whatever the CURRENT stage's mechanism animates, posed from the model's pivot every
-	-- frame. Owned by the stage, not by this file, so a second stage opens something else
-	-- instead of replaying the lid.
-	local poser: ((CFrame, number) -> boolean)? = nil
-	local finishOpen: () -> ()
-
-	--[[
-		Stage one's mechanism: the lid swings on its hinge and the prize rises out of the box.
-		It poses BOTH, so the whole animation is one closure the stage owns -- and it keeps
-		posing after it returns true, which is what holds the lid and prize attached to the
-		object while the player turns it in free look.
-	]]
-	local function lidMechanism(): ((CFrame, number) -> boolean)?
-		local swing = Feedback.lid(
-			stage.lid,
-			stage.lidHingeLocal,
-			stage.lidClosedLocal,
-			TUNE.lidSweepDeg,
-			TUNE.lidTime
-		)
-		local t = 0
-		local spinAngle = 0
-		return function(root: CFrame, dt: number): boolean
-			local done = swing(root, dt)
-			t = math.min(t + dt / TUNE.lidTime, 1)
-			-- Fast while it rises, then a slow idle turn that carries on through free look, so
-			-- an opened box does not read as a frozen tableau.
-			spinAngle += dt * (0.9 + 3.4 * (1 - t))
-			stage.prize.CFrame = root
-				* stage.prizeClosedLocal:Lerp(stage.prizeOpenLocal, Damp.easeOutQuint(t))
-				* CFrame.Angles(0, spinAngle, 0)
-			return done
-		end
-	end
-
-	firstPuzzle.mechanism = lidMechanism
-
-	local function beginReveal()
-		phase = "Revealing"
-		local puzzle = current
-		poser = if puzzle and puzzle.mechanism then puzzle.mechanism() else nil
-		fx.fire("solved")
-		hud.setState("OPEN")
-		hud.setHint("R to reset · Q or EXIT to leave")
-		if not poser then
-			-- A stage whose payoff is the snap itself has nothing to animate; do not sit in
-			-- Revealing waiting for a poser that will never report finished.
-			finishOpen()
-		end
-	end
-
-	--[[
-		The mechanism has finished running. Either the stage hands over a successor -- straight
-		back into Play against the new pair -- or the object is simply left turnable, which is
-		what makes authoring a later stage possible at all.
-	]]
-	function finishOpen()
-		local solved = current
-		local nextPuzzle: Puzzle? = nil
-		if solved and solved.onSolved then
-			nextPuzzle = solved.onSolved()
-		end
-
-		current = nextPuzzle
-		gate.reset()
-		prox, proxRaw = 1, 0
-
-		if nextPuzzle then
-			aimAtCurrent()
-			phase = "Play"
-			drag.setEnabled(true)
-			hud.setState("")
-			hud.setHint(`stage: {nextPuzzle.name} · drag to turn`)
-			return
-		end
-
-		phase = "Opened"
-		if TUNE.freeLookAfterOpen then
-			drag.setEnabled(true)
-			hud.setHint("free look · R to reset · Q or EXIT to leave")
-		else
-			hud.setHint("R to reset · Q or EXIT to leave")
-		end
-	end
-
-	local function resetPuzzle()
-		phase = "Settling"
-		settleFor = 0
-		prox, proxRaw = 0, 0
-		poser = nil
-		gate.reset()
-		current = firstPuzzle
-		aimAtCurrent()
-		spin.set(TUNE.startYaw, TUNE.startPitch)
-		drag.setEnabled(false)
-		local root = stage.model:GetPivot()
-		stage.lid.CFrame = root * stage.lidClosedLocal
-		stage.prize.CFrame = root * stage.prizeClosedLocal
-		hud.setState("")
-		hud.setHint("")
-		hud.setProgress(0, false, false)
-	end
-
-	--------------------------------------------------------------------------------
-	-- input that is not the drag
-	--------------------------------------------------------------------------------
-	local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
-		if processed then
-			return
-		end
-		if input.KeyCode == Enum.KeyCode.E or input.KeyCode == Enum.KeyCode.Space then
-			commitQueued = true
-		elseif input.KeyCode == Enum.KeyCode.R then
-			resetQueued = true
-		elseif input.KeyCode == Enum.KeyCode.Q then
-			doExit()
-		end
-	end)
-	table.insert(restores, function()
-		inputConn:Disconnect()
-	end)
-
-	--------------------------------------------------------------------------------
-	-- THE FRAME LOOP. One binding, one writer per property, one dt clamp.
-	--------------------------------------------------------------------------------
-	RunService:BindToRenderStep(BIND, Enum.RenderPriority.Camera.Value + 1, function(rawDt: number)
-		local dt = Damp.clampDt(rawDt)
-
-		if resetQueued then
-			resetQueued = false
-			-- Any time except mid-snap, where it would fight the one animation the player is
-			-- not driving. Handy when filming: R re-scrambles without leaving the view.
-			if phase ~= "Committing" then
-				resetPuzzle()
-			end
-		end
-
-		-- 1. input: accumulated in callbacks, consumed exactly once here
-		local f = drag.consume()
-		-- Turning is allowed while a stage is live AND during free look after the mechanism has
-		-- run. Only the committing/revealing window takes the object away from the player.
-		local canTurn = phase == "Play" or phase == "Opened"
-		if canTurn then
-			if f.dx ~= 0 or f.dy ~= 0 then
-				spin.drag(f.dx, f.dy)
-			end
-			-- A tap is a commit, not a flick. Throwing the box on the click that was meant to
-			-- engage it is the most annoying possible way to miss the window.
-			if f.released and not f.tapped then
-				spin.release(f.velX, f.velY)
-			end
-		end
-
-		-- 2. commit arbitration. Accepted at the ARM threshold, not the lock threshold: a
-		--    click at the visually perfect moment must never be refused.
-		local wantsCommit = commitQueued or f.tapped
-		commitQueued = false
-		if wantsCommit and phase == "Play" and current and gate.armed() then
-			phase = "Committing"
-			holdFor = 0
-			spin.freeze()
-			spin.snapTo(targetYaw, targetPitch)
-			drag.setEnabled(false) -- leftover inertia must not fight the snap
-			hud.setState("ENGAGING")
-		end
-
-		-- 3. one integrator for drag, coast and snap, so there is no seam between them
-		local yaw, pitch = spin.step(dt, proxRaw)
-
-		-- 4. the ONE line that differs from the world-scale demos
-		rig.apply(yaw, pitch)
-
-		-- 5. the lid is posed AFTER the pivot write, from the pivot, every frame it animates:
-		--    PivotTo moves descendants rigidly by the frame's delta, so anything mid-animation
-		--    has to be written absolutely, and from this frame's root.
-		local root = stage.model:GetPivot()
-		if poser then
-			local finished = poser(root, dt)
-			if finished and phase == "Revealing" then
-				finishOpen()
-			end
-		end
-
-		-- 6. the eye AS RENDERED this frame, after the pose write. Never a cached value and
-		--    never camera.Focus.
-		local render = cam:GetRenderCFrame()
-		local eye = render.Position
-		local look = render.LookVector
-
-		-- 7-9. score the pose that was actually written, unless scoring is suspended
-		if phase == "Settling" then
-			settleFor += dt
-			proxRaw = 0
-			hud.setProgress(prox, false, false)
-			if settleFor >= TUNE.settleTime then
-				phase = "Play"
-				drag.setEnabled(true)
-				hud.setHint("drag to turn the box")
-			end
-		elseif phase == "Play" and current then
-			local puzzle = current :: Puzzle
-			local p = Align.probe(
-				eye,
-				look,
-				puzzle.near.WorldPosition,
-				puzzle.far.WorldPosition,
-				TUNE.home.Position,
-				TUNE.subjectRadius,
-				TUNE.minDepthGap,
-				TUNE.anchorSlackFrac
-			)
-			local scored = if p.valid and p.orderOk then p.sepNorm else math.huge
-			proxRaw = Align.closeness(scored, TUNE.enterFrac, TUNE.bandFrac, TUNE.gamma)
-			gate.update(scored, dt)
-
-			local enteredLocked, _leftLocked = gate.edges()
-			if enteredLocked then
-				fx.fire("locked")
-			end
-
-			local state = gate.state()
-			-- Gated on the same predicate as the action. Locked says the anchors coincide; armed
-			-- says the dwell has elapsed and a click will actually be taken. A fast sweep can
-			-- satisfy the first without the second.
-			local canCommit = gate.armed()
-			hud.setState(
-				if state == "Locked" and canCommit
-					then "ALIGNED — click or E"
-					elseif state == "Locked" then "ALIGNED"
-					elseif canCommit then "click or E to engage"
-					else ""
-			)
-			hud.setProgress(prox, canCommit, state == "Locked")
-		elseif phase == "Opened" then
-			-- Free look. No stage is live, so nothing is scored and the glow relaxes -- but the
-			-- object still turns, and the lid and prize are still posed from the pivot every
-			-- frame, so it reads as an opened box being examined rather than a frozen tableau.
-			proxRaw = 0
-			hud.setProgress(prox, false, false)
-		else
-			-- Committing / Revealing: the snap sweeps straight through the lock band by
-			-- construction and would re-fire everything. Hold the signal lit instead.
-			proxRaw = 1
-			hud.setProgress(1, false, true)
-		end
-
-		-- the single smoothed scalar every channel reads
-		prox = Damp.dampAsym(prox, proxRaw, dt, TUNE.attackTau, TUNE.releaseTau)
-		fx.render(prox, dt)
-
-		-- 11. the reveal is caused by the snap, not simultaneous with it
-		if phase == "Committing" then
-			if spin.justLanded() then
-				holdFor = 0.0001
-			end
-			if holdFor > 0 then
-				holdFor += dt
-				if holdFor >= TUNE.postSnapHold then
-					beginReveal()
-				end
-			end
-		end
-	end)
-
-	table.insert(restores, function()
-		RunService:UnbindFromRenderStep(BIND)
-	end)
-
-	hud.setHint("")
-	hud.fade(1, 0.45)
-end
-
-local function enter()
-	if active then
-		return
-	end
-	active = true
-	local ok, err = pcall(startSession :: () -> any)
+local function attempt(what: string, write: () -> ()): boolean
+	local ok, err = pcall(write :: () -> any)
 	if not ok then
-		warn(`[demo1] session failed to start: {err}`)
-		teardown()
+		warn(`[shell] {what} was refused: {err}`)
+	end
+	return ok
+end
+
+--[[
+	SetCore errors until the CoreScripts have registered the callback, so it needs a retry
+	rather than a single pcall.
+]]
+local function disableResetButton()
+	task.spawn(function()
+		for _ = 1, 40 do
+			local ok = pcall(function()
+				StarterGui:SetCore("ResetButtonCallback", false)
+			end)
+			if ok then
+				print("[shell] reset button disabled")
+				return
+			end
+			task.wait(0.25)
+		end
+		warn("[shell] could not disable the reset button; respawns are still handled")
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- global state the shell owns
+--------------------------------------------------------------------------------
+
+--[[
+	ONE Lighting snapshot, taken at boot and re-asserted on every return to the menu. Demos take
+	scoped leases through ctx.dim and undo them in their own teardown; this is the backstop for a
+	demo that dies before its undo runs.
+]]
+local baseline = {
+	fogEnd = Lighting.FogEnd,
+	fogStart = Lighting.FogStart,
+	brightness = Lighting.Brightness,
+	ambient = Lighting.Ambient,
+}
+
+local function reassertLighting()
+	Lighting.FogEnd = baseline.fogEnd
+	Lighting.FogStart = baseline.fogStart
+	Lighting.Brightness = baseline.brightness
+	Lighting.Ambient = baseline.ambient
+end
+
+local function restoreMouse()
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	UserInputService.MouseIconEnabled = true
+end
+
+local function restoreCamera()
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	cam.FieldOfViewMode = Enum.FieldOfViewMode.Vertical
+	cam.FieldOfView = 70
+	if humanoid then
+		cam.CameraSubject = humanoid
+	end
+	cam.CameraType = Enum.CameraType.Custom -- LAST
+end
+
+--------------------------------------------------------------------------------
+-- demo registry
+--------------------------------------------------------------------------------
+
+local function locked(id: string, title: string, blurb: string): Shell.Controller
+	return {
+		id = id,
+		title = title,
+		blurb = blurb,
+		ready = false,
+		region = CFrame.new(),
+		start = function(): boolean
+			return false
+		end,
+		stop = function() end,
+	}
+end
+
+local demos: { Shell.Controller } = {
+	Demo1,
+	Demo2,
+	locked("connector", "DEMO 3 — IMPOSSIBLE CONNECTOR", "Two beams that only meet from one seat."),
+	locked("forced", "DEMO 4 — FORCED PERSPECTIVE", "Pick a distant object up as if it were near."),
+}
+
+local activeDemo: Shell.Controller? = nil
+local activeBind: string? = nil
+local respawnAt = LOBBY
+local characterHooks: { (Model) -> () } = {}
+
+local menu: Menu.Handle
+
+local function place(cf: CFrame)
+	respawnAt = cf
+	Shell.placeCharacter(player, cf)
+end
+
+local function leaveDemo()
+	local live = activeDemo
+	if not live then
+		return
+	end
+	activeDemo = nil
+	table.clear(characterHooks)
+
+	live.stop()
+
+	local bind = activeBind
+	if bind then
+		Shell.releaseBind(bind)
+		activeBind = nil
+	end
+
+	-- Unconditional, in this order, whatever the demo did or failed to do.
+	restoreMouse()
+	reassertLighting()
+	restoreCamera()
+	respawnAt = LOBBY
+	Shell.placeCharacter(player, LOBBY)
+
+	menu.show()
+end
+
+local function enterDemo(id: string)
+	if activeDemo then
+		return
+	end
+	local chosen: Shell.Controller? = nil
+	for _, demo in demos do
+		if demo.id == id and demo.ready then
+			chosen = demo
+		end
+	end
+	if not chosen then
+		return
+	end
+	local controller: Shell.Controller = chosen
+
+	menu.hide()
+	local bind = Shell.claimBind(`Alignment_{controller.id}`)
+	activeBind = bind
+	activeDemo = controller
+
+	local ctx: Shell.Context = {
+		player = player,
+		camera = cam,
+		playerGui = playerGui,
+		bindName = bind,
+		exit = function()
+			task.defer(leaveDemo)
+		end,
+		place = place,
+		dim = Shell.dim,
+		onCharacter = function(fn: (Model) -> ())
+			table.insert(characterHooks, fn)
+		end,
+	}
+
+	if not controller.start(ctx) then
+		warn(`[shell] {controller.id} failed to start`)
+		leaveDemo()
 	end
 end
 
 --------------------------------------------------------------------------------
--- entry
+-- respawn: the shell's problem, never a demo's
 --------------------------------------------------------------------------------
+
+player.CharacterAdded:Connect(function(character: Model)
+	character:WaitForChild("HumanoidRootPart", 10)
+	task.wait(0.15) -- let the default camera acquire the fresh Humanoid before we take it back
+
+	if activeDemo then
+		-- Put them back where they were playing, then take the camera back: a respawn hands
+		-- CameraType to the default scripts, which would otherwise fight the demo forever.
+		Shell.placeCharacter(player, respawnAt)
+		cam.CameraType = Enum.CameraType.Scriptable
+		for _, fn in characterHooks do
+			local ok, err = pcall(fn :: (Model) -> any, character)
+			if not ok then
+				warn(`[shell] character hook failed: {err}`)
+			end
+		end
+	else
+		Shell.placeCharacter(player, LOBBY)
+		restoreCamera()
+	end
+end)
+
+--------------------------------------------------------------------------------
+-- boot
+--------------------------------------------------------------------------------
+
+local entries: { Menu.Entry } = {}
+for _, demo in demos do
+	table.insert(entries, { id = demo.id, title = demo.title, blurb = demo.blurb, ready = demo.ready })
+end
+menu = Menu.new(playerGui, entries, enterDemo)
+menu.hide()
 
 UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
 	if processed then
 		return
 	end
-	if input.KeyCode == Enum.KeyCode.I and not active then
-		enter()
-	end
-end)
-
--- A respawn hands the camera back to the default scripts mid-session, so the session has to
--- end with it. Compared against the character the session was STARTED with: StarterPlayerScripts
--- are usually cloned before the first character replicates, so an unguarded handler tears the
--- demo down a moment after it boots.
-player.CharacterAdded:Connect(function(character: Model)
-	if active and character ~= sessionCharacter then
-		local leave = exitSession
-		if leave then
-			task.defer(leave)
-		else
-			task.defer(teardown)
-		end
+	-- A safety net, not the advertised exit: demos own Q so they can fade out first.
+	if input.KeyCode == Enum.KeyCode.Q and not activeDemo and not menu.visible() then
+		menu.show()
 	end
 end)
 
@@ -775,8 +276,21 @@ task.spawn(function()
 	if not player.Character then
 		player.CharacterAdded:Wait()
 	end
-	-- One beat for the default camera to acquire the fresh Humanoid, so the snapshot restore
-	-- has something coherent to hand back to.
-	task.wait(0.2)
-	enter()
+
+	-- Wait for the loading screen to hand over, but never hang on it.
+	local waited = 0
+	while not ReplicatedFirst:GetAttribute("LoadingDone") and waited < BOOT_TIMEOUT do
+		waited += task.wait()
+	end
+	if waited >= BOOT_TIMEOUT then
+		warn("[shell] loading screen never reported done; continuing anyway")
+	end
+
+	attempt("Lighting baseline", reassertLighting)
+	disableResetButton()
+	restoreMouse()
+	restoreCamera()
+	place(LOBBY)
+	menu.show()
+	print(`[shell] ready · {#demos} demos registered`)
 end)

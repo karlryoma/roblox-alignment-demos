@@ -4,8 +4,12 @@ Roblox tech demos on camera/perspective alignment illusions — the Monument Val
 Echochrome / Superliminal / The Room family. Showcase pieces for a developer audience,
 not a shipped game: client-only, no server authority, placeholder art on purpose.
 
-**Demo 1 — Item Inspection** is built. Demos 2–4 are world-scale variants that reuse
-`src/shared` unchanged.
+| # | Demo | State |
+| --- | --- | --- |
+| 1 | **Item inspection** — a puzzle box turned in the hand, near-orthographic | built |
+| 2 | **Room-scale align-to-unlock** — walk a room, two-step chain | built |
+| 3 | Impossible connector | not built |
+| 4 | Forced perspective | not built |
 
 ## Running it
 
@@ -15,110 +19,136 @@ rojo serve            # port 34873; Studio: Rojo plugin -> Connect
 ```
 
 Studio: **File → New** (Baseplate), **Save As** `sandbox.rbxlx` here, connect, press Play.
-The demo enters itself once the character exists.
+A loading screen hands over to a menu; pick a demo, and `Q` or the on-screen **EXIT**
+returns you to the menu.
 
-```
-drag          turn the box (mouse or touch) — also after it opens
-click / E     engage, once the HUD says it is armed
-R             reset to the first stage
-Q or EXIT     leave the inspection view
-I             re-enter
-```
+Run `rojo serve` from **Windows PowerShell**, not WSL: the file watcher does not fire on
+`/mnt/c`, so a WSL-hosted server silently serves a stale tree. Editing
+`default.project.json` always needs a server restart.
 
-Not Escape — the Roblox menu owns that key, so `InputBegan` never sees it with
-`gameProcessedEvent` false.
+---
 
-## What it does
+## Demo 1 — Item inspection
 
-A 3-stud puzzle box turns in front of a near-orthographic camera. Two anchors sit at
-different depths inside it, collinear with the pivot. From exactly one viewing direction
-they coincide; approaching it escalates glow / hum / motes, and committing snaps to the
-exact solution and swings the lid open.
+<!-- GIF: demo1.gif -->
 
-## The three decisions that matter
+Drag to turn the box · click or `E` to engage when armed · `R` reset · `Q` leave.
 
-**1. `atan2`, not `acos`.** The obvious test is `acos(ua:Dot(ub))`. At FOV 1 it does not
-merely lose precision, it returns nothing at all. The lock tolerance is 0.0097°, so
-`1 - cos(0.0097°) = 1.42e-8`, against a float32 ULP at 1.0 of `1.19e-7` — and Vector3
-components are float32. Measured: at the lock threshold the float32 dot product rounds to
-exactly `1.0`, so `acos` reports `0.000000°` where `atan2(|a×b|, a·b)` in doubles reports
-`0.009665°`. `Align.selfTest()` prints both at boot.
+Two anchors sit at different depths inside a 3-stud box, collinear with its pivot. From
+exactly one viewing direction they coincide; committing there snaps to the exact solution
+and swings the lid open. The box stays turnable afterwards, so further stages can be
+authored against whatever the reveal exposed.
 
-**2. Tolerance is a fraction of the subject's apparent diameter**, not degrees and not
-pixels. Degrees mean different things at FOV 1 and FOV 70; a screen fraction changes
-difficulty when the fit distance is refit for portrait. The identity
-`sepNorm = delta * L / (2r)` means the lock window *in degrees of drag* depends only on the
-object's own geometry, so the same four authored numbers give the same feel on a 200-stud
-monument in demo 3.
+**`atan2`, not `acos`.** The obvious test is `acos(ua:Dot(ub))`. At FOV 1 it returns
+nothing at all: the lock tolerance is 0.0097°, so `1 - cos(0.0097°) = 1.42e-8` against a
+float32 ULP at 1.0 of `1.19e-7` — and Vector3 components are float32. Measured: at the lock
+threshold the float32 dot rounds to exactly `1.0`, so `acos` reports `0.000000°` where
+`atan2(|a×b|, a·b)` in doubles reports `0.009665°`. `Align.selfTest()` prints both at boot.
 
-**3. Two degrees of freedom, not three.** Roll about the eye–pivot axis is an isometry
-fixing the eye, so it preserves every angle subtended there and provably cannot solve the
-puzzle. State is `(yaw, pitch)` and the CFrame is rebuilt from scratch each frame: no
-accumulated shear, no drag-axis inversion, no locking while upside down, and the snap
-target is closed-form.
+**The raw lock window is ~14 mouse pixels wide** — correct, and unhittable. Fixed by damping
+the drag gain inside the band and arming the commit at a much wider threshold, never by
+loosening the tolerance. Loosening it makes the illusion lie.
 
-A corollary worth stating: the raw lock window is ~14 mouse pixels wide — correct, and
-unhittable. That is fixed by damping the drag gain inside the band and arming the commit at
-a much wider threshold, never by loosening the tolerance. Loosening it makes the illusion
-lie.
+## Demo 2 — Room-scale align-to-unlock
+
+<!-- GIF: demo2.gif -->
+
+Walk with WASD · drag to orbit · click or `E` to engage when armed · drag the panel ·
+`R` reset · `Q` leave.
+
+Alignment does not spawn or move anything here — it **gates an interaction**. Nothing
+teleports and no geometry appears, so nothing can look wrong from an off angle. The chain
+is the point: align → the bolts retract and a wall panel becomes draggable → drag it aside
+→ a second pair is exposed in the alcove → align again → the door opens. One alignment is a
+trick; alignment → action → new alignment is a system.
+
+**Unlock persistence: for one visit.** Everything is rebuilt inside `start()`, so a menu
+round-trip resets the room to locked. Persisting across round-trips would mean lifting the
+state above `start()/stop()` and *applying* it to geometry on re-entry rather than replaying
+the animation.
+
+**The camera is custom, and that was forced.** There is no pitch-clamp property — `Player`
+exposes `CameraMaxZoomDistance`, `CameraMinZoomDistance`, `CameraMode`,
+`DevCameraOcclusionMode`, `DevComputerCameraMode`, `DevTouchCameraMode`, and nothing for
+pitch; the default camera's vertical limit is hard-coded in PlayerModule, which this project
+may not require (luau-lsp cannot resolve it through the sourcemap, so it fails the gate).
+And a commit that re-poses the view needs `CameraType = Scriptable`, which the default
+camera cannot share. So `Orbit` owns the camera, and therefore owns the clamp. Walking still
+works: the default control module derives its move vector from `workspace.CurrentCamera.CFrame`.
+
+### Why demo 2 reverses demo 1's FOV, and why that is right
+
+Demo 1 runs at FOV 1. Demo 2 runs at FOV 70. That is not inconsistency.
+
+Roblox has **no orthographic camera** — still an open, unanswered feature request — and
+`FieldOfView` is hard-clamped to [1, 120]. The standard approximation is FOV = 1 with a
+distant camera, at a required distance of about **57 × the on-screen height of the subject**
+(57.29 = 0.5 / tan(0.5°)). At item scale that is free: a 3-stud subject needs ~372 studs
+once you frame against its *circumradius* rather than its half-extent, which costs nothing.
+At room scale it is not: a 50-stud room needs ~2,850 studs and hits render-distance culling
+on low graphics settings.
+
+But the real argument is not cost. **Perspective is better here.** Under orthographic
+projection only camera *rotation* changes an alignment, giving a few discrete states. Under
+perspective, position **and** rotation change it continuously — and that continuous search
+space is the entire "walk around until it lines up" feel. Demo 1 wants the near-ortho look
+because a handheld object read at a fixed standoff should not distort. Demo 2 wants
+perspective because walking is the verb.
+
+Correspondingly, demo 1's `atan2`-over-`acos` argument is a FOV-1 precision argument and
+**does not bind at room scale**: `1 - cos(1°) = 1.52e-4` is about 1,280 float32 ULPs, so
+`acos` would be numerically fine at a 1–2° tolerance. Demo 2 still calls `Align.probe`,
+because a second hand-written test is exactly the two-sources-of-truth failure this codebase
+warns about, and because the *predicates* are the part that matters.
+
+---
 
 ## Layout
 
 | File | Role |
 | --- | --- |
 | `src/shared/Align.luau` | Pure geometry: separation, probe, closed-form solve, hysteresis gate. No Instances. |
-| `src/shared/Damp.luau` | Framerate-independent smoothing. Every constant is a time constant. |
+| `src/shared/Chain.luau` | Staged alignment: per-stage params, poser list, aim-failure propagation. |
+| `src/shared/Session.luau` | Acquire/undo lifecycle. LIFO teardown, guarded start. |
+| `src/shared/Shell.luau` | Shell↔demo contract, bind-name registry, per-effect lighting, character helpers. |
+| `src/shared/Orbit.luau` | Scriptable third-person camera that follows a walking avatar (demo 2, and 3). |
+| `src/shared/Mount.luau` | The near-ortho rig. `Mount.object` (demo 1) / `Mount.orbit` (fixed subject). |
 | `src/shared/Spin.luau` | View-sphere state; one integrator for drag, coast and snap. |
-| `src/shared/Mount.luau` | The near-ortho rig. `Mount.object` (demo 1) / `Mount.orbit` (demos 2–4). |
-| `src/client/Drag.luau` | Input capture only; accumulate in callbacks, consume once per frame. |
-| `src/client/Feedback.luau` | Proximity-driven channels + the angle-driven hinged lid. |
-| `src/client/Stage.luau` | Client-built placeholder geometry. |
-| `src/client/Hud.luau` | Meter, state line, fade, exit button. |
-| `src/client/init.client.luau` | The demo: TUNE table, state machine, the single render step. |
+| `src/shared/Damp.luau` | Framerate-independent smoothing. Every constant is a time constant. |
+| `src/client/init.client.luau` | **The shell.** The only LocalScript: menu, hosting, respawn, global restores. |
+| `src/client/Demo1/`, `Demo2/` | The demos. Each is a controller with `start(ctx)` / `stop()`. |
+| `src/replicatedFirst/` | The loading screen. Requires nothing from `src/client`. |
 
-`bash scripts/check.sh` — sourcemap + `luau-lsp analyze` + `selene`.
+`bash scripts/check.sh` — sourcemap + `luau-lsp analyze` + `selene`. Must be 0 errors,
+0 warnings.
 
-## Chaining stages
+### Two rules that are not style
 
-The box stays turnable after the lid opens (`TUNE.freeLookAfterOpen`), so a second alignment
-can be authored against whatever the reveal exposed. A stage is an anchor pair, the mechanism
-it drives, and what comes next:
+**The subject sphere is the anchor pair's own neighbourhood, never the room's.**
+`Align.probe` divides by the pair's apparent angular diameter to make the tolerance
+dimensionless. `subtendDeg` returns 180 when the eye is *inside* that sphere — so passing
+the room's centre and circumradius puts the eye inside it for the whole session, `sepNorm`
+silently becomes `sepDeg / 180`, and the demo looks like it works while responding to nothing
+you authored. `probe` now fails closed on it, and demo 2 asserts it every frame.
 
-```lua
-local core: Puzzle = {
-    name = "core",
-    near = stage.coreNear,                    -- Attachments, read live as WorldPosition
-    far = stage.coreFar,
-    nearLocal = Vector3.new(0, 0.4, 0.55),    -- the SAME points in the model's frame
-    farLocal = Vector3.new(0, 0.4, -0.55),
-    mechanism = function() return myPoser() end,  -- or nil: then the snap is the payoff
-    onSolved = nil,                           -- return another Puzzle to chain again
-}
--- and on the stage before it:
-onSolved = function() return core end
-```
+**Thresholds are dimensionless; demo 1's are not portable.** Author the window in degrees and
+divide once by the subject subtend (`Chain.fromDegrees`). Feeding raw degrees makes
+`Align.closeness` saturate for everything below 1 — a ramp that is flat forever. `minGap` is
+the one exception: it is in **studs**, and must be re-derived per stage at roughly half the
+baseline, or the wrong-side guard goes toothless exactly where it matters.
 
-`nearLocal`/`farLocal` are what the closed-form solve runs on, so they must be the
-attachments' own local positions — otherwise the snap aims at a pose where the anchors do not
-actually coincide. The solved orientation is always derived, never authored.
+## Place settings
 
-`mechanism` returns a per-frame poser `(rootCF, dt) -> done`. It keeps being called after it
-reports done, which is what holds its parts attached while the object is turned afterwards.
-A stage with no mechanism finishes the instant the snap lands.
+`StreamingEnabled` and `FallenPartsDestroyHeight` are set from `default.project.json`'s
+`Workspace` node, because neither can be set from a script and the place file is not tracked
+— so a fresh clone reproduces them without anyone touching the Properties panel.
 
-## Porting to demos 2–4
+## Porting to demos 3–4
 
-Swap `Mount.object` for `Mount.orbit`: the camera then orbits and the world stays put.
-Nothing else in `src/shared` changes, because the alignment test is written in world space
-against whatever pose was actually rendered this frame — it does not care which side moved.
-Both mounts read `(yaw, pitch)` in the frame the anchors were authored in, so
-`Align.solve`'s answer is portable between them.
+Demo 3 (camera orbits a fixed monument) reuses `Align`, `Chain`, `Session`, `Shell` and
+`Orbit` unchanged, and swaps `Mount.object` for `Mount.orbit`. The alignment test is written
+in world space against whatever pose was actually rendered this frame — it does not care
+whether the object moved or the camera did.
 
-What is demo-1-only: `Stage.luau`, and `Feedback.halo`'s world-fixed reticle rest poses
-(fine while the camera is parked, needs re-posing per frame once the camera orbits).
-
-## WSL note
-
-Rojo's file watcher does not fire on `/mnt/c`. A `rojo serve` started from WSL keeps serving
-the source as it was when the process launched. Run it from Windows PowerShell, or restart
-it after each edit. Editing `default.project.json` always needs a restart.
+Demo-1-only: `Demo1/Stage.luau`, and `Feedback.halo`, whose rest poses are captured in world
+space and only hold while the camera is parked.

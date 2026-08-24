@@ -22,6 +22,15 @@
 	    button poll. Alt-tabbing mid-drag otherwise leaves a sticky drag with a pinned cursor.
 	  * Tap and drag are distinguished, so the commit click cannot nudge the box three pixels
 	    on its way through.
+
+	ONE SURFACE, TWO JOBS. A demo that both orbits a camera and drags an object in the world
+	cannot open a second Drag: two full-screen capture surfaces fight over InputBegan. Instead
+	`classify` is asked, ON PRESS and BEFORE any mouse lock, what this press is for. It returns
+	a mode string that rides on the frame, and the caller routes accordingly.
+
+	A press classified as anything other than "orbit" keeps the cursor FREE -- no
+	LockCurrentPosition, no hidden icon -- because differencing GetMouseLocation returns zero
+	under the lock, and a world-space manipulation needs a live screen point to unproject.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -40,6 +49,12 @@ export type Frame = {
 	held: boolean,
 	released: boolean,
 	tapped: boolean,
+	mode: string, -- whatever `classify` returned on the press; "orbit" by default
+	pos: Vector2, -- live pointer position, valid while a non-orbit press is held
+}
+
+export type Options = {
+	classify: ((pos: Vector2) -> string)?,
 }
 
 export type Handle = {
@@ -52,7 +67,8 @@ local VELOCITY_TAU = 0.08 -- people decelerate before letting go; the last frame
 local TAP_SECONDS = 0.25
 local TAP_TRAVEL = 0.006 -- fraction of viewport height
 
-function Drag.new(camera: Camera, parentGui: Instance): Handle
+function Drag.new(camera: Camera, parentGui: Instance, options: Options?): Handle
+	local classify = if options then options.classify else nil
 	local surface = Instance.new("TextButton")
 	surface.Name = "DragSurface"
 	surface.Size = UDim2.fromScale(1, 1)
@@ -71,6 +87,8 @@ function Drag.new(camera: Camera, parentGui: Instance): Handle
 	local latched: InputObject? = nil
 	local isTouch = false
 	local skipFirstTouchMove = false
+	local mode = "orbit"
+	local pointer = Vector2.zero
 
 	local pendX, pendY = 0, 0
 	local vel = Vector2.zero
@@ -115,7 +133,14 @@ function Drag.new(camera: Camera, parentGui: Instance): Handle
 		travel = 0
 		pendX, pendY = 0, 0
 		vel = Vector2.zero
-		if not touch then
+
+		-- Classified BEFORE the lock, because after it there is no screen point left to test.
+		pointer = if touch
+			then Vector2.new(input.Position.X, input.Position.Y)
+			else UserInputService:GetMouseLocation()
+		mode = if classify then classify(pointer) else "orbit"
+
+		if not touch and mode == "orbit" then
 			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
 			UserInputService.MouseIconEnabled = false
 		end
@@ -155,6 +180,9 @@ function Drag.new(camera: Camera, parentGui: Instance): Handle
 			pendX += d.X
 			pendY += d.Y
 			travel += (math.abs(d.X) + math.abs(d.Y)) / viewportY()
+			pointer = if isTouch
+				then Vector2.new(input.Position.X, input.Position.Y)
+				else UserInputService:GetMouseLocation()
 		end)
 	)
 
@@ -212,6 +240,8 @@ function Drag.new(camera: Camera, parentGui: Instance): Handle
 				held = dragging,
 				released = releasedFlag,
 				tapped = tappedFlag,
+				mode = mode,
+				pos = pointer,
 			}
 			releasedFlag = false
 			tappedFlag = false

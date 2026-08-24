@@ -9,6 +9,11 @@
 
 	The fade tweens a plain overlay, which is safe: no property here is written by the render
 	loop, so there is no second writer.
+
+	HAZARD: the veil is built OPAQUE (BackgroundTransparency 0, ZIndex 50), because the entry to
+	a demo is a cut from black. Every controller's start() must therefore end with fade(1, ...)
+	or the demo boots to a black screen with no error and nothing in the output. That is a real
+	trap once start()/stop() is being called repeatedly from a menu.
 ]]
 
 local TweenService = game:GetService("TweenService")
@@ -19,6 +24,7 @@ export type Handle = {
 	gui: ScreenGui,
 	layer: Frame,
 	exitButton: TextButton,
+	setTitle: (text: string) -> (),
 	setProgress: (p: number, armed: boolean, locked: boolean) -> (),
 	setState: (text: string) -> (),
 	setHint: (text: string) -> (),
@@ -31,9 +37,9 @@ local WARM = Color3.fromRGB(96, 190, 220)
 local HOT = Color3.fromRGB(150, 245, 255)
 local ARMED = Color3.fromRGB(255, 214, 120)
 
-function Hud.new(parent: Instance): Handle
+function Hud.new(parent: Instance, titleText: string?): Handle
 	local gui = Instance.new("ScreenGui")
-	gui.Name = "Demo1Hud"
+	gui.Name = "AlignmentHud"
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
 	gui.DisplayOrder = 20
@@ -56,7 +62,7 @@ function Hud.new(parent: Instance): Handle
 	title.TextSize = 15
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.TextColor3 = DIM
-	title.Text = "ALIGNMENT DEMO 1 — ITEM INSPECTION"
+	title.Text = titleText or "ALIGNMENT DEMO"
 	title.ZIndex = 3
 	title.Parent = layer
 
@@ -144,6 +150,10 @@ function Hud.new(parent: Instance): Handle
 		gui = gui,
 		layer = layer,
 		exitButton = exitButton,
+
+		setTitle = function(text: string)
+			title.Text = text
+		end,
 
 		setProgress = function(p: number, armed: boolean, locked: boolean)
 			local k = math.clamp(p, 0, 1)
