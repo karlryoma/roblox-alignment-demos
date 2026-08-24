@@ -1,0 +1,13 @@
+# Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+# Generated static-analysis inputs (recreated by scripts/check.sh)
+/sourcemap.json
+/globalTypes.d.luau
+
+# Built place: regenerate with `rojo build -o sandbox.rbxlx`.
+# Track it instead if you start hand-building world geometry in Studio.
+/sandbox.rbxlx
+
+/.claude/settings.local.json
