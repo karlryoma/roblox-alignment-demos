@@ -34,11 +34,19 @@ export type NodeSpec = {
 
 export type Handle = {
 	folder: Folder,
+	--[[ One Model per movable unit -- the two slabs and the rotor -- each holding its geometry,
+	     its skirt and its seam markers, with the Attachments on the slab inside. PivotTo then
+	     moves a whole walkway and its seam as one, which is what the map editor needs. ]]
+	models: { [string]: Model },
 	surfaces: Folder,
 	occluders: Folder,
 	rotor: Model,
 	rotorDeck: BasePart,
 	setRotor: (turns: number) -> (),
+	--[[ Move the rotor's REST POSE. setRotor re-issues an absolute PivotTo from that pose every
+	     time it runs, so a plain PivotTo on the model is erased by the next call -- the map editor
+	     has to move the home instead. ]]
+	nudgeRotorHome: (delta: Vector3) -> (),
 	rotorPivot: CFrame,
 	attachments: { [string]: Attachment },
 	markers: { [string]: BasePart },
@@ -61,6 +69,15 @@ local SHADE = Color3.fromRGB(152, 134, 120)
 
 Level.ROTOR_PIVOT = Vector3.new(0, 6, 0)
 
+--[[ Where each movable unit is authored. Kept as data so the map editor can print an export the
+     level file can absorb verbatim. ]]
+local SURFACE_AT: { [string]: Vector3 } = {
+	S = Vector3.new(-12, -6.5, 0),
+	T = Vector3.new(10, 15.5, -20),
+	R = Vector3.new(0, 6, 0),
+}
+Level.SURFACE_AT = SURFACE_AT
+
 local NODES: { NodeSpec } = {
 	{ id = "S_end", surface = "S", at = Vector3.new(-12, -6, -6), outward = Vector3.new(0, 0, -1), onRotor = false },
 	{ id = "T_start", surface = "T", at = Vector3.new(10, 16, -14), outward = Vector3.new(0, 0, 1), onRotor = false },
@@ -68,6 +85,13 @@ local NODES: { NodeSpec } = {
 	{ id = "R_b", surface = "R", at = Vector3.new(4, 6, 0), outward = Vector3.new(1, 0, 0), onRotor = true },
 }
 Level.NODES = NODES
+
+--[[ The pairs the level intends, for the boot assertion and for the map editor's SOLVE. ]]
+local INTENDED: { { string } } = {
+	{ "S_end", "R_a" },
+	{ "R_b", "T_start" },
+}
+Level.INTENDED = INTENDED
 
 local REAL_EDGES: { { string } } = {}
 Level.REAL_EDGES = REAL_EDGES
@@ -123,12 +147,22 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 	occluders.Parent = folder
 
 	local hosts: { [string]: BasePart } = {}
-	hosts.S = newPart("S", Vector3.new(12, 1, 12), Vector3.new(-12, -6.5, 0), SAND, origin, surfaces, true)
-	hosts.T = newPart("T", Vector3.new(12, 1, 12), Vector3.new(10, 15.5, -20), ROSE, origin, surfaces, true)
+	local models: { [string]: Model } = {}
+
+	local function surfaceModel(name: string, size: Vector3, at: Vector3, colour: Color3, skirtAt: Vector3): BasePart
+		local model = Instance.new("Model")
+		model.Name = name
+		model.Parent = surfaces
+		models[name] = model
+		local slab = newPart(name, size, at, colour, origin, model, true)
+		newPart(name .. "-skirt", Vector3.new(11, 1.6, 11), skirtAt, SHADE, origin, model, false)
+		model.WorldPivot = slab.CFrame
+		return slab
+	end
 
 	-- Painted-on ambient occlusion: at this distance shadows are dead, so the depth cue is colour.
-	newPart("S-skirt", Vector3.new(11, 1.6, 11), Vector3.new(-12, -7.6, 0), SHADE, origin, surfaces, false)
-	newPart("T-skirt", Vector3.new(11, 1.6, 11), Vector3.new(10, 14.4, -20), SHADE, origin, surfaces, false)
+	hosts.S = surfaceModel("S", Vector3.new(12, 1, 12), SURFACE_AT.S, SAND, SURFACE_AT.S - Vector3.new(0, 1.1, 0))
+	hosts.T = surfaceModel("T", Vector3.new(12, 1, 12), SURFACE_AT.T, ROSE, SURFACE_AT.T - Vector3.new(0, 1.1, 0))
 
 	--[[ The rotor. 8 x 12, so its two seam edges sit at different radii and the four states are
 	     genuinely four states. ]]
@@ -142,12 +176,21 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 	deck.CanQuery = true
 	rotor.Parent = folder
 
+	-- Mutable: this is the rotor's rest pose, and the map editor edits it.
 	local rotorHome = origin * CFrame.new(Level.ROTOR_PIVOT)
+	local rotorTurns = 0
 	-- No PrimaryPart: with one set, GetPivot returns that part's CFrame and PivotTo would shift
 	-- the whole deck by its offset instead of turning about the intended axis.
 	rotor.WorldPivot = rotorHome
+	models.R = rotor
 	local function setRotor(turns: number)
+		rotorTurns = turns
 		rotor:PivotTo(rotorHome * CFrame.Angles(0, math.rad(90 * turns), 0))
+	end
+	local function nudgeRotorHome(delta: Vector3)
+		rotorHome = rotorHome + delta
+		rotor.WorldPivot = rotorHome
+		setRotor(rotorTurns)
 	end
 	setRotor(0)
 
@@ -183,7 +226,7 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 			node.at + Vector3.new(0, 0.07, 0) - node.outward * 0.3,
 			Level.COLD,
 			origin,
-			if node.onRotor then rotor else folder,
+			models[node.surface],
 			false,
 			Enum.Material.Neon
 		)
@@ -191,13 +234,15 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 		table.insert(bars, bar)
 	end
 
+	-- Parented to its surface: a goal left behind in the folder would sit where the walkway used
+	-- to be as soon as the map is edited.
 	local goal = newPart(
 		"Goal",
 		Vector3.new(3, 0.3, 3),
 		Vector3.new(10, 16.15, -24),
 		Color3.fromRGB(255, 210, 120),
 		origin,
-		folder,
+		models[Level.GOAL_SURFACE],
 		false,
 		Enum.Material.Neon
 	)
@@ -206,16 +251,19 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 
 	local handle: Handle = {
 		folder = folder,
+		models = models,
 		surfaces = surfaces,
 		occluders = occluders,
 		rotor = rotor,
 		rotorDeck = deck,
 		setRotor = setRotor,
+		nudgeRotorHome = nudgeRotorHome,
 		rotorPivot = rotorHome,
 		attachments = attachments,
 		markers = markers,
 		bars = bars,
-		spawnCF = origin * CFrame.new(-12, -2.5, 3),
+		-- An offset from the start surface's own pivot, so an edited map spawns on the moved slab.
+		spawnCF = models[Level.START_SURFACE]:GetPivot() * CFrame.new(0, 4, 3),
 		goal = goal,
 		centre = Vector3.new(-1, 4.5, -10),
 		boundsMin = trackedMin,

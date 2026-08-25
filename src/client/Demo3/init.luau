@@ -40,6 +40,7 @@ local Shell = require(ReplicatedStorage.Shared.Shell)
 local Drag = require(script.Parent.Drag)
 local Feedback = require(script.Parent.Feedback)
 local Hud = require(script.Parent.Hud)
+local Editor = require(script.Parent.Editor)
 local Building = require(script.Building)
 
 local TUNE = {
@@ -57,11 +58,11 @@ local TUNE = {
 	startYawDeg = 20,
 	startPitchDeg = 30,
 
-	--[[ Screen-space slack, in studs of the parallel projection. At D = 400 the visible frame is
-	     ~42 studs tall, so 0.9 studs is about 2% of frame height -- roughly 23 px at 1080p. Wide
+	--[[ Slack, as the angle the two points subtend at the eye -- which is zero exactly when they
+	     are drawn on the same pixel. 0.13 deg is about 23 px of a 1080p frame at FOV 6: wide
 	     enough that a settle within ~3 degrees of the exact angle takes, narrow enough that the
-	     player is genuinely hunting for the angle. ]]
-	epsilon = 0.9,
+	     player is genuinely hunting for it. Viewport-independent by construction. ]]
+	epsilonDeg = 0.13,
 
 	-- Dwell: below this angular speed for this long and the world crystallises.
 	settleSpeedDeg = 6,
@@ -128,7 +129,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 		end
 
 		local seamOptions = Seam.defaults()
-		seamOptions.epsilon = TUNE.epsilon
+		seamOptions.epsilonDeg = TUNE.epsilonDeg
 		seamOptions.occluders = { building.occluders }
 
 		-- Authoring assertion: a pair whose orientations do not match cannot be crossed by a pure
@@ -166,12 +167,21 @@ function Demo3.start(ctx: Shell.Context): boolean
 			local halfV = math.tan(math.rad(TUNE.fovDeg) * 0.5)
 			local vp = cam.ViewportSize
 			local aspect = if vp.Y > 0 then vp.X / vp.Y else 1
-			local lo, hi = building.boundsMin, building.boundsMax
+			--[[ Measured from the LIVE geometry, not from bounds captured at build time: the map
+			     editor moves surfaces, and a stale box crops the frame or wastes it. ]]
+			local lo = Vector3.new(math.huge, math.huge, math.huge)
+			local hi = Vector3.new(-math.huge, -math.huge, -math.huge)
+			for _, item in building.folder:GetDescendants() do
+				if item:IsA("BasePart") then
+					lo = lo:Min(item.Position - item.Size * 0.5)
+					hi = hi:Max(item.Position + item.Size * 0.5)
+				end
+			end
 			local corners: { Vector3 } = {}
 			for _, x in { lo.X, hi.X } do
 				for _, y in { lo.Y, hi.Y } do
 					for _, z in { lo.Z, hi.Z } do
-						table.insert(corners, (origin * CFrame.new(x, y, z)).Position)
+						table.insert(corners, Vector3.new(x, y, z))
 					end
 				end
 			end
@@ -296,6 +306,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 		-- state
 		--------------------------------------------------------------------------------
 		local settled = false
+		local editing = false
 		local stillFor = 0
 		local prevYaw, prevPitch = orbit.get()
 		local settleYaw, settlePitch = 0, 0
@@ -342,7 +353,9 @@ function Demo3.start(ctx: Shell.Context): boolean
 			-- the fix for the case that would otherwise read as a bug: settling while standing ON
 			-- a seam that goes live. It is per-node and self-releasing, so unlike a blanket timer
 			-- it never eats a crossing the player is legitimately walking into.
-			traverser.setGraph(graph, ctx.player.Character)
+			-- Never armed while the map is being edited: being teleported mid-nudge is
+			-- indistinguishable from the map being wrong.
+			traverser.setGraph(if editing then nil else graph, ctx.player.Character)
 			table.clear(liveBars)
 			for _, edge in graph.edges do
 				local barA = building.markers[nodes[edge.a].id]
@@ -382,11 +395,116 @@ function Demo3.start(ctx: Shell.Context): boolean
 			stillFor = 0
 		end
 
+		--------------------------------------------------------------------------------
+		-- the map editor
+		--
+		-- These illusions are composed by eye, so the composition belongs to a person. One entry
+		-- per (surface, seam): moving a surface moves its walkway, its skirt and its seam marker
+		-- together, and SOLVE places it so that seam coincides exactly from wherever the camera
+		-- is standing right now.
+		--------------------------------------------------------------------------------
+		local editorTargets: { Editor.Target } = {}
+		for _, pair in Building.INTENDED do
+			for _, ends in { { pair[1], pair[2] }, { pair[2], pair[1] } } do
+				local nodeId, partnerId = ends[1], ends[2]
+				local spec: Building.NodeSpec? = nil
+				for _, candidate in Building.NODES do
+					if candidate.id == nodeId then
+						spec = candidate
+					end
+				end
+				local surfaceName = (spec :: Building.NodeSpec).surface
+				table.insert(editorTargets, {
+					id = `{surfaceName}  (seam {nodeId}~{partnerId})`,
+					model = building.models[surfaceName],
+					seams = {
+						{
+							node = building.attachments[nodeId],
+							partner = building.attachments[partnerId],
+							label = `{nodeId}~{partnerId}`,
+						},
+					},
+					export = function(offset: Vector3): { string }
+						local lines: { string } = {}
+						for _, surface in Building.SURFACES do
+							if surface.name == surfaceName then
+								local at = surface.at + offset
+								table.insert(
+									lines,
+									("SURFACES %s: at = Vector3.new(%.2f, %.2f, %.2f)"):format(surface.name, at.X, at.Y, at.Z)
+								)
+							end
+						end
+						for _, candidate in Building.NODES do
+							if candidate.surface == surfaceName then
+								local at = candidate.local_ + offset
+								table.insert(
+									lines,
+									("NODES %s: local_ = Vector3.new(%.2f, %.2f, %.2f)"):format(candidate.id, at.X, at.Y, at.Z)
+								)
+							end
+						end
+						return lines
+					end,
+				})
+			end
+		end
+
+		local editorFreeze: (() -> ())? = nil
+		local editor = Editor.new(editorTargets, {
+			camera = cam,
+			playerGui = ctx.playerGui,
+			-- A moved surface invalidates whatever was settled: rebuild it so the lit seams and
+			-- the readout always describe the geometry as it is now.
+			onChanged = function()
+				opts.distance = fitDistance()
+				if settled then
+					settle()
+				end
+			end,
+			onOpen = function()
+				editing = true
+				traverser.setGraph(nil, nil)
+				local character = ctx.player.Character
+				local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+				if humanoid then
+					local walk = humanoid.WalkSpeed
+					humanoid.WalkSpeed = 0
+					editorFreeze = function()
+						if humanoid.Parent then
+							humanoid.WalkSpeed = walk
+						end
+					end
+				end
+			end,
+			onClose = function()
+				editing = false
+				if editorFreeze then
+					editorFreeze()
+					editorFreeze = nil
+				end
+				if settled then
+					settle()
+				end
+			end,
+		})
+		s.add(function()
+			if editorFreeze then
+				editorFreeze()
+				editorFreeze = nil
+			end
+		end)
+		s.add(editor.destroy)
+
 		local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
 			if processed then
 				return
 			end
-			if input.KeyCode == Enum.KeyCode.R then
+			if input.KeyCode == Enum.KeyCode.F2 then
+				-- Everything the mode change implies lives in the editor's own open/close hooks,
+				-- so a later edit cannot quietly re-arm what this switched off.
+				editor.toggle()
+			elseif input.KeyCode == Enum.KeyCode.R then
 				resetQueued = true
 			elseif input.KeyCode == Enum.KeyCode.Q then
 				doExit()
@@ -412,14 +530,24 @@ function Demo3.start(ctx: Shell.Context): boolean
 				local a, b = nodes[indexById[pair[1]]], nodes[indexById[pair[2]]]
 				local offset = b.point.WorldPosition - a.point.WorldPosition
 				found += 1
+				--[[ The offset direction IS the view direction that makes the pair coincide, so the
+				     angle to hunt for is not a mystery: print it. ]]
+				--[[ The line through the pair has two directions and only one of them is a camera
+				     the player can reach; print the one inside the pitch clamp. ]]
+				local yaw, pitch = Align.toSpherical(offset)
+				if math.deg(pitch) < TUNE.minPitchDeg then
+					yaw, pitch = Align.toSpherical(-offset)
+				end
 				print(
-					("[demo3] seam %s~%s: offset (%.0f, %.0f, %.0f), %.1f studs of depth to jump"):format(
+					("[demo3] seam %s~%s: offset (%.0f, %.0f, %.0f), %.1f studs deep · coincides at yaw %.1f deg, pitch %.1f deg"):format(
 						pair[1],
 						pair[2],
 						offset.X,
 						offset.Y,
 						offset.Z,
-						offset.Magnitude
+						offset.Magnitude,
+						(math.deg(yaw) + 360) % 360,
+						math.deg(pitch)
 					)
 				)
 			end
@@ -466,6 +594,8 @@ function Demo3.start(ctx: Shell.Context): boolean
 				resetQueued = false
 				resetDemo()
 			end
+
+			editor.step(dt)
 
 			local f = drag.consume()
 			if f.dx ~= 0 or f.dy ~= 0 then
@@ -524,7 +654,10 @@ function Demo3.start(ctx: Shell.Context): boolean
 					local localPos = origin:PointToObjectSpace(root.Position)
 
 					-- Arriving is worth acknowledging: without it the route just ends.
-					if not solved and math.abs(localPos.X - 17) < 2.5 and math.abs(localPos.Z - 6) < 2.5 and localPos.Y > 2 then
+					-- Measured against the goal part's LIVE position, not the authored literal: the
+					-- goal rides its surface, so an edited map must still be completable.
+					local toGoal = root.Position - building.goal.Position
+					if not solved and math.abs(toGoal.X) < 2.5 and math.abs(toGoal.Z) < 2.5 and math.abs(toGoal.Y) < 6 then
 						solved = true
 						flashFor = 0.3
 						hud.setState("SOLVED — two angles, one route")
@@ -556,7 +689,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 			RunService:UnbindFromRenderStep(bind)
 		end)
 
-		hud.setHint("hold the camera still to weave")
+		hud.setHint("hold the camera still to weave · F2 edits the map")
 		hud.fade(1, 0.45)
 	end)
 end

@@ -34,6 +34,11 @@ export type NodeSpec = {
 
 export type Handle = {
 	folder: Folder,
+	--[[ One Model per walkable surface, holding its slab, its skirt and its seam markers, with
+	     the seam Attachments on the slab inside it. That grouping is what makes a surface an
+	     EDITABLE UNIT: PivotTo moves the walkway, its lights and its seam together, so nudging a
+	     map by eye cannot desync the geometry from the graph. ]]
+	models: { [string]: Model },
 	boundsMin: Vector3,
 	boundsMax: Vector3,
 	surfaces: Folder,
@@ -61,6 +66,8 @@ local SURFACES: { { name: string, size: Vector3, at: Vector3, colour: Color3 } }
 	{ name = "B", size = Vector3.new(6, 1, 12), at = Vector3.new(12, 11.5, -2), colour = TEAL },
 	{ name = "C", size = Vector3.new(12, 1, 4), at = Vector3.new(13, 3.5, 6), colour = ROSE },
 }
+
+Building.SURFACES = SURFACES
 
 local NODES: { NodeSpec } = {
 	{ id = "A_end", surface = "A", local_ = Vector3.new(0, 0, -8), outward = Vector3.new(0, 0, -1) },
@@ -133,8 +140,14 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 	occluders.Parent = folder
 
 	local byName: { [string]: BasePart } = {}
+	local models: { [string]: Model } = {}
 	for _, spec in SURFACES do
-		local part = newPart(spec.name, spec.size, spec.at, spec.colour, origin, surfaces, true)
+		local model = Instance.new("Model")
+		model.Name = spec.name
+		model.Parent = surfaces
+		models[spec.name] = model
+
+		local part = newPart(spec.name, spec.size, spec.at, spec.colour, origin, model, true)
 		byName[spec.name] = part
 		-- A darker skirt under each slab: at this distance shadows are weak, so the ambient
 		-- occlusion is painted on.
@@ -144,9 +157,11 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 			spec.at - Vector3.new(0, 1.3, 0),
 			SHADE,
 			origin,
-			surfaces,
+			model,
 			false
 		)
+		-- Pivot on the slab, so an editor's exported offset is the slab's offset.
+		model.WorldPivot = part.CFrame
 	end
 
 	-- Support columns. These ARE occluders: a seam hidden behind one must not connect.
@@ -191,17 +206,20 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 			false,
 			Enum.Material.Neon
 		)
+		bar.Parent = models[node.surface] -- rides with its surface when the map is edited
 		markers[node.id] = bar
 		table.insert(glow, bar)
 	end
 
+	-- Parented to its surface, so an edited map keeps its goal: a goal left behind in the folder
+	-- would sit where the walkway used to be and the route could never be completed.
 	local goal = newPart(
 		"Goal",
 		Vector3.new(3, 0.3, 3),
 		Vector3.new(17, 4.15, 6),
 		Color3.fromRGB(255, 208, 116),
 		origin,
-		folder,
+		models[Building.GOAL_SURFACE],
 		false,
 		Enum.Material.Neon
 	)
@@ -210,6 +228,7 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 
 	local handle: Handle = {
 		folder = folder,
+		models = models,
 		boundsMin = trackedMin,
 		boundsMax = trackedMax,
 		surfaces = surfaces,
@@ -217,8 +236,9 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 		markers = markers,
 		attachments = attachments,
 		glow = glow,
-		-- On surface A, facing -Z: the first seam is at the far end of the walkway.
-		spawnCF = origin * CFrame.new(0, 3.5, 6),
+		-- On surface A, facing -Z: the first seam is at the far end of the walkway. Expressed as an
+		-- offset from the surface's own pivot below, so an edited map spawns on the moved walkway.
+		spawnCF = models[Building.START_SURFACE]:GetPivot() * CFrame.new(0, 4, 6),
 		goal = goal,
 		centre = Vector3.new(7.5, 6, 0),
 		destroy = function()

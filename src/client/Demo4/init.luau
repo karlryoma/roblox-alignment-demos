@@ -52,6 +52,7 @@ local Shell = require(ReplicatedStorage.Shared.Shell)
 
 local Feedback = require(script.Parent.Feedback)
 local Hud = require(script.Parent.Hud)
+local Editor = require(script.Parent.Editor)
 local Level = require(script.Level)
 
 local TUNE = {
@@ -61,7 +62,9 @@ local TUNE = {
 	frameMargin = 1.12,
 	framePad = 2.0,
 
-	epsilon = 0.9,
+	--[[ Slack as the angle the pair subtends at the eye: zero exactly when they are drawn on the
+	     same pixel. 0.07 deg is about 25 px of a 1080p frame at FOV 3. ]]
+	epsilonDeg = 0.07,
 	--[[ The rotation IS the mechanic. Fast enough not to drag, slow enough that the player
 	     watches the join arrive. ]]
 	turnTime = 0.65,
@@ -122,12 +125,21 @@ function Demo4.start(ctx: Shell.Context): boolean
 			local halfV = math.tan(math.rad(TUNE.fovDeg) * 0.5)
 			local vp = cam.ViewportSize
 			local aspect = if vp.Y > 0 then vp.X / vp.Y else 1
-			local lo, hi = level.boundsMin, level.boundsMax
+			--[[ Measured from the LIVE geometry, not from bounds captured at build time: the map
+			     editor moves surfaces, and a stale box crops the frame or wastes it. ]]
+			local lo = Vector3.new(math.huge, math.huge, math.huge)
+			local hi = Vector3.new(-math.huge, -math.huge, -math.huge)
+			for _, item in level.folder:GetDescendants() do
+				if item:IsA("BasePart") then
+					lo = lo:Min(item.Position - item.Size * 0.5)
+					hi = hi:Max(item.Position + item.Size * 0.5)
+				end
+			end
 			local corners: { Vector3 } = {}
 			for _, x in { lo.X, hi.X } do
 				for _, y in { lo.Y, hi.Y } do
 					for _, z in { lo.Z, hi.Z } do
-						table.insert(corners, (origin * CFrame.new(x, y, z)).Position)
+						table.insert(corners, Vector3.new(x, y, z))
 					end
 				end
 			end
@@ -195,7 +207,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 		end
 
 		local seamOptions = Seam.defaults()
-		seamOptions.epsilon = TUNE.epsilon
+		seamOptions.epsilonDeg = TUNE.epsilonDeg
 		seamOptions.occluders = { level.occluders }
 
 		local traverser = Seam.newTraverser(nodes, Seam.traverserDefaults())
@@ -281,6 +293,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 
 		local liveBars: { [BasePart]: boolean } = {}
 		local flashFor = 0
+		local editing = false
 
 		local fx = Feedback.new()
 		s.add(fx.destroy)
@@ -299,7 +312,8 @@ function Demo4.start(ctx: Shell.Context): boolean
 
 		local function installGraph()
 			local graph = graphs[key(camState, rotorState)]
-			traverser.setGraph(graph, ctx.player.Character)
+			-- Never armed while the map is being edited.
+			traverser.setGraph(if editing then nil else graph, ctx.player.Character)
 			table.clear(liveBars)
 			for _, edge in graph.edges do
 				local barA = level.markers[nodes[edge.a].id]
@@ -400,22 +414,140 @@ function Demo4.start(ctx: Shell.Context): boolean
 			lastSafe = level.spawnCF
 			setWalkable(true)
 			installGraph()
-			hud.setHint("← → turn the view · F turns the bridge · R reset · Q or EXIT to leave · wants high graphics")
+			hud.setHint("← → turn the view · F turns the bridge · F2 edits the map · R reset · Q to leave")
 		end
+
+		--------------------------------------------------------------------------------
+		-- the map editor
+		--
+		-- One entry per (surface, seam), including the rotor: moving a unit moves its geometry and
+		-- its seam markers together, and SOLVE places it so that seam coincides exactly from the
+		-- camera state you are looking from. Composing the shot is a judgement about a picture;
+		-- the arithmetic is the part that belongs in code.
+		--------------------------------------------------------------------------------
+		local editorTargets: { Editor.Target } = {}
+		for _, pair in Level.INTENDED do
+			for _, ends in { { pair[1], pair[2] }, { pair[2], pair[1] } } do
+				local nodeId, partnerId = ends[1], ends[2]
+				local surfaceName = ""
+				for _, candidate in Level.NODES do
+					if candidate.id == nodeId then
+						surfaceName = candidate.surface
+					end
+				end
+				table.insert(editorTargets, {
+					id = `{surfaceName}  (seam {nodeId}~{partnerId})`,
+					model = level.models[surfaceName],
+					--[[ The rotor is re-posed from a stored home every time setRotor runs, so a
+					     PivotTo on the model would be erased within the frame. Move the home. ]]
+					apply = if surfaceName == "R" then level.nudgeRotorHome else nil,
+					seams = {
+						{
+							node = level.attachments[nodeId],
+							partner = level.attachments[partnerId],
+							label = `{nodeId}~{partnerId}`,
+						},
+					},
+					export = function(offset: Vector3): { string }
+						local lines: { string } = {}
+						if surfaceName == "R" then
+							--[[ The rotor is placed by ROTOR_PIVOT and its nodes are authored in the
+							     rotor's own rest frame, so they do not move with it: one line. ]]
+							local moved = Level.ROTOR_PIVOT + offset
+							table.insert(
+								lines,
+								("Level.ROTOR_PIVOT = Vector3.new(%.2f, %.2f, %.2f)"):format(moved.X, moved.Y, moved.Z)
+							)
+							return lines
+						end
+						local at = Level.SURFACE_AT[surfaceName]
+						if at then
+							local moved = at + offset
+							table.insert(
+								lines,
+								("SURFACE_AT %s = Vector3.new(%.2f, %.2f, %.2f)"):format(surfaceName, moved.X, moved.Y, moved.Z)
+							)
+						end
+						for _, candidate in Level.NODES do
+							if candidate.surface == surfaceName then
+								local point = candidate.at + offset
+								table.insert(
+									lines,
+									("NODES %s: at = Vector3.new(%.2f, %.2f, %.2f)"):format(candidate.id, point.X, point.Y, point.Z)
+								)
+							end
+						end
+						return lines
+					end,
+				})
+			end
+		end
+
+		local editor = Editor.new(editorTargets, {
+			camera = cam,
+			playerGui = ctx.playerGui,
+			-- Sixteen graphs are a snapshot of the geometry, so a moved surface invalidates all of
+			-- them. Re-baking is milliseconds and it keeps the lit seams honest.
+			onChanged = function()
+				distance = fitDistance()
+				bakeAll()
+				level.setRotor(rotorState)
+				installGraph()
+			end,
+			onOpen = function()
+				editing = true
+				traverser.setGraph(nil, nil)
+				setWalkable(false)
+			end,
+			onClose = function()
+				editing = false
+				setWalkable(turning <= 0)
+				installGraph()
+			end,
+			-- Mid-rotation the camera is showing an angle the game can never settle at, so
+			-- authoring against it would bake a state that does not exist.
+			canSolve = function(): boolean
+				return turning <= 0
+			end,
+		})
+		s.add(editor.destroy)
 
 		local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
 			if processed then
 				return
 			end
-			if input.KeyCode == Enum.KeyCode.Left then
-				beginTurn(-1)
-			elseif input.KeyCode == Enum.KeyCode.Right then
-				beginTurn(1)
-			elseif input.KeyCode == Enum.KeyCode.F then
+			local code = input.KeyCode
+
+			if code == Enum.KeyCode.F2 then
+				-- Everything the mode change implies lives in the editor's open/close hooks.
+				editor.toggle()
+				return
+			end
+
+			--[[ While the editor is open the arrow keys belong to it, so view rotation moves to
+			     comma/period. One branch, so the two bindings cannot drift apart. ]]
+			local turnDelta = 0
+			if editor.isOpen() then
+				if code == Enum.KeyCode.Comma then
+					turnDelta = -1
+				elseif code == Enum.KeyCode.Period then
+					turnDelta = 1
+				end
+			elseif code == Enum.KeyCode.Left then
+				turnDelta = -1
+			elseif code == Enum.KeyCode.Right then
+				turnDelta = 1
+			end
+			if turnDelta ~= 0 then
+				beginTurn(turnDelta)
+				return
+			end
+
+			if code == Enum.KeyCode.F then
 				beginRotor()
-			elseif input.KeyCode == Enum.KeyCode.R then
+			elseif code == Enum.KeyCode.R then
 				resetQueued = true
-			elseif input.KeyCode == Enum.KeyCode.Q then
+			elseif code == Enum.KeyCode.Q then
 				doExit()
 			end
 		end)
@@ -446,6 +578,42 @@ function Demo4.start(ctx: Shell.Context): boolean
 					(1080 / 2) / (distance * math.tan(math.rad(TUNE.fovDeg) * 0.5))
 				)
 			)
+			--[[ For each authored pair, the view direction that makes it coincide -- which is just
+			     the direction of the offset between them. Printed so the angle to look from is a
+			     stated fact rather than something to hunt for. ]]
+			--[[ A rotor seam only exists at the rotor state that puts it there, so the angle has to
+			     be measured per rotor state, not at whatever state happens to be current. ]]
+			for _, pair in Level.INTENDED do
+				for r = 0, 3 do
+					level.setRotor(r)
+					local a = level.attachments[pair[1]]
+					local b = level.attachments[pair[2]]
+					if a and b then
+						local offset = b.WorldPosition - a.WorldPosition
+						local yaw, pitch = Align.toSpherical(offset)
+						if math.deg(pitch) < 0 then
+							yaw, pitch = Align.toSpherical(-offset)
+						end
+						local yawDeg = (math.deg(yaw) + 360) % 360
+						for _, stateYaw in TUNE.yawDeg do
+							if math.abs(yawDeg - stateYaw) < 6 then
+								print(
+									("[demo4] seam %s~%s: rotor %d, coincides at yaw %.1f deg, pitch %.1f deg (%.1f studs deep)"):format(
+										pair[1],
+										pair[2],
+										r,
+										yawDeg,
+										math.deg(pitch),
+										offset.Magnitude
+									)
+								)
+							end
+						end
+					end
+				end
+			end
+			level.setRotor(rotorState)
+
 			local soloSolve: string? = nil
 			for c = 0, 3 do
 				local row = {}
@@ -478,7 +646,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 		end
 
 		installGraph()
-		hud.setHint("← → turn the view · F turns the bridge · R reset · Q or EXIT to leave · wants high graphics")
+		hud.setHint("← → turn the view · F turns the bridge · F2 edits the map · R reset · Q to leave · wants high graphics")
 
 		--------------------------------------------------------------------------------
 		-- THE FRAME LOOP
@@ -486,6 +654,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 		local bind = ctx.bindName
 		RunService:BindToRenderStep(bind, Enum.RenderPriority.Camera.Value + 1, function(rawDt: number)
 			local dt = Damp.clampDt(rawDt)
+			editor.step(dt)
 
 			if resetQueued then
 				resetQueued = false
@@ -541,7 +710,10 @@ function Demo4.start(ctx: Shell.Context): boolean
 				if root and root:IsA("BasePart") then
 					local localPos = origin:PointToObjectSpace(root.Position)
 
-					if not solved and math.abs(localPos.X - 10) < 2.5 and math.abs(localPos.Z + 24) < 2.5 then
+					-- Against the goal's LIVE position: it rides its surface, so an edited map must
+					-- still be completable.
+					local toGoal = root.Position - level.goal.Position
+					if not solved and math.abs(toGoal.X) < 2.5 and math.abs(toGoal.Z) < 2.5 and math.abs(toGoal.Y) < 6 then
 						solved = true
 						flashFor = 0.3
 						hud.setState("SOLVED — one angle, one turn, one route")

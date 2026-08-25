@@ -7,12 +7,21 @@
 	moves, and there is no commit button: the building's connectivity is a function of the camera
 	angle alone.
 
-	THE DECOUPLING THAT MAKES THIS SAFE. The rendering is an APPROXIMATION of an orthographic
-	projection (Roblox has no orthographic camera; the trick is a small FieldOfView at a long
-	distance). The logic here is EXACT: Seam.project drops the depth component in camera space
-	with no perspective divide at all. So the illusion being imperfect can never leak into
-	correctness -- the worst a rendering error can do is make a join look slightly off, never make
-	the game disagree with itself.
+	THE TEST IS THE ANGLE SUBTENDED AT THE EYE, and that correction matters.
+
+	An earlier version measured the idealised PARALLEL projection -- drop the depth component in
+	camera space, no perspective divide -- on the theory that exact logic could not then inherit
+	the rendering's approximation. That reasoning was backwards. Roblox renders in perspective, so
+	two points that a parallel projection calls coincident are drawn apart by roughly
+	(distance from frame centre) x (depth between them) / (camera distance). Near the middle of
+	the frame that is a pixel or two; a seam composed ten studs off centre is visibly separated
+	while the logic insists it is joined. The player judges the picture, so the picture is the
+	authority.
+
+	At a finite camera distance "the two points land on the same pixel" IS "the two points subtend
+	no angle at the eye", which is what this measures. It agrees with the render everywhere in
+	frame, it is independent of viewport size and aspect, and it is the same measure demos 1 and 2
+	use -- so the whole repo now speaks one language.
 
 	THE ORIENTATION RULE, which is what lets a crossing be free. Two nodes may only connect when
 	their surfaces share an up-vector and their outward directions are opposite. Then the crossing
@@ -71,7 +80,7 @@ export type Edge = {
 	a: number,
 	b: number,
 	depthDelta: number, -- studs of depth jumped; the crossing is invisible, this is not
-	screenGap: number, -- how far apart the two projections actually were
+	screenGap: number, -- degrees of angular separation at the eye when this was built
 }
 
 export type Graph = {
@@ -83,25 +92,62 @@ export type Graph = {
 }
 
 export type Options = {
-	epsilon: number, -- studs of screen-space separation that still counts as coincident
+	--[[ Degrees of angular separation at the eye that still counts as coincident. Convert from a
+	     pixel budget with (px / viewportY) * fovDeg -- it is the same number in every viewport. ]]
+	epsilonDeg: number,
 	occluders: { Instance }, -- ONLY these block a sight line
 	rayLength: number,
 	backoff: number, -- stop the ray short, so a node's own surface is not "in front of" it
 }
 
 --[[
-	Exact orthographic projection: drop the depth component in camera space. No perspective
-	divide, no viewport, no pixels -- screen position is in STUDS, which is the natural unit for
-	a parallel projection.
+	Parallel projection, kept because framing maths wants it: fitting a camera distance to a
+	bounding box is a question about the idealised projection, not about what connects. Screen
+	position is in STUDS, the natural unit when there is no divide.
+
+	It is NOT what decides connectivity -- see Seam.separationDeg.
 ]]
 function Seam.project(worldPos: Vector3, camCF: CFrame): (Vector2, number)
 	local p = camCF:PointToObjectSpace(worldPos)
 	return Vector2.new(p.X, p.Y), -p.Z
 end
 
+--[[
+	The angle the two points subtend at the eye, in degrees: zero exactly when they are drawn on
+	the same pixel, at any distance and anywhere in frame.
+
+	atan2 of the cross magnitude rather than acos of the dot: the sine has no cancellation near
+	zero, which is the whole range that matters here. The components are read into Lua doubles
+	before the subtraction because Vector3 is float32.
+]]
+function Seam.separationDeg(eye: Vector3, a: Vector3, b: Vector3): number
+	local ex, ey, ez = eye.X, eye.Y, eye.Z
+	local ax, ay, az = a.X - ex, a.Y - ey, a.Z - ez
+	local bx, by, bz = b.X - ex, b.Y - ey, b.Z - ez
+	local cx = ay * bz - az * by
+	local cy = az * bx - ax * bz
+	local cz = ax * by - ay * bx
+	local cross = math.sqrt(cx * cx + cy * cy + cz * cz)
+	local dot = ax * bx + ay * by + az * bz
+	if cross == 0 and dot == 0 then
+		return 180 -- the eye is sitting on a node: fail closed
+	end
+	local deg = math.deg(math.atan2(cross, dot))
+	return if deg ~= deg then 180 else deg
+end
+
+--[[ How many pixels a given angular separation covers, for readouts. ]]
+function Seam.degToPixels(deg: number, fovDeg: number, viewportY: number): number
+	if fovDeg <= 0 then
+		return 0
+	end
+	return (deg / fovDeg) * viewportY
+end
+
 function Seam.defaults(): Options
 	return {
-		epsilon = 0.9,
+		-- ~0.13 deg is about 23 px of a 1080p frame at FOV 6.
+		epsilonDeg = 0.13,
 		occluders = {},
 		rayLength = 600,
 		backoff = 0.75,
@@ -135,11 +181,10 @@ end
 ]]
 function Seam.build(nodes: { Node }, camCF: CFrame, options: Options): Graph
 	local count = #nodes
-	local screen: { Vector2 } = table.create(count)
+	local eye = camCF.Position
 	local depth: { number } = table.create(count)
 	for i, node in nodes do
-		local pos, d = Seam.project(node.point.WorldPosition, camCF)
-		screen[i] = pos
+		local _, d = Seam.project(node.point.WorldPosition, camCF)
 		depth[i] = d
 	end
 
@@ -171,8 +216,8 @@ function Seam.build(nodes: { Node }, camCF: CFrame, options: Options): Graph
 
 	for a = 1, count - 1 do
 		for b = a + 1, count do
-			local gap = (screen[a] - screen[b]).Magnitude
-			if gap <= options.epsilon then
+			local gap = Seam.separationDeg(eye, nodes[a].point.WorldPosition, nodes[b].point.WorldPosition)
+			if gap <= options.epsilonDeg then
 				graph.tested += 1
 				if Seam.orientationFault(nodes[a], nodes[b]) then
 					graph.rejectedOrientation += 1

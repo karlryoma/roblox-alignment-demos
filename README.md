@@ -135,10 +135,19 @@ because paired seam nodes share a surface normal and have **opposite outward dir
 `Seam.orientationFault` asserts it at boot, because a mismatched pair would silently mangle
 velocity.
 
-**The seams are exact, not fitted.** Under a parallel projection two points coincide precisely
-when their difference is parallel to the view direction, so at the isometric pitch a join is an
-offset of (k,k,k): `A_end → B_start` is (12,12,12) and lives at yaw 45°; `B_end → C_start` is
-(−8,−8,8) and lives at yaw 135°. Neither is live at the other's angle, so the route needs both.
+**How a seam is authored, and a correction.** Under a *parallel* projection two points coincide
+exactly when their difference is parallel to the view direction, so at the isometric pitch a join
+is an offset of (k,k,k): `A_end → B_start` is (12,12,12) and lives at yaw 45°; `B_end → C_start`
+is (−8,−8,8) and lives at yaw 135°. Neither is live at the other's angle, so the route needs
+both.
+
+But Roblox renders in **perspective**, and the test now measures what is actually drawn: the
+angle the two points subtend at the eye, which is zero exactly when they land on the same pixel.
+An earlier version tested the idealised parallel projection, which is not the same thing —
+perspective separates two points by roughly (distance from frame centre) × (depth between them)
+÷ (camera distance), so a seam composed off-centre would look apart while the logic insisted it
+was joined. These two seams sit near frame centre, so they measure 2.0 px and 3.6 px apart at
+the real eye; the editor's SOLVE zeroes that.
 
 **Deliberate limitation: every walkable surface is a floor.** Roblox gravity is global −Y with
 no per-character override, so Monument Valley's walls-become-floors moments are out unless the
@@ -158,12 +167,16 @@ between four fixed isometric angles, so it is *always* settled — nothing to wa
 seams are live the instant a rotation lands. Same character, same walking, same `Seam` core.
 
 **The bake is the architectural point.** Four camera states × four sub-model positions = sixteen
-connectivity graphs, all computed at `start()`. That decouples two things that look coupled: the
-**rendering** approximates an orthographic projection and only has to fool the eye, while the
-**logic** is exact — `Seam.project` drops the depth component in camera space with no
-perspective divide at all. So the illusion being imperfect can never leak into correctness. The
-bake summary prints at boot: the per-state seams, and an assertion that no single state reaches
-the goal.
+connectivity graphs, all computed at `start()`. Because the camera has finitely many poses,
+connectivity is a finite table rather than a per-frame measurement: no runtime screen-space
+maths, no drift, and a click is answered by a lookup.
+
+The test inside each bake is the angle the two points subtend **at the eye** — zero exactly when
+they are drawn on the same pixel. (An earlier version tested an idealised parallel projection on
+the theory that exact logic could not inherit the render's approximation. That was backwards:
+the player judges the picture, so the picture is the authority.) The bake summary prints at
+boot — per-state seams, the angle each coincides at, and an assertion that no single state
+reaches the goal.
 
 **The route needs both rotations.** `S_end → R_a` is live only at yaw 45° with the bridge at
 rest; `R_b → T_start` only at yaw 135° with the bridge turned once. The bridge's seams are
@@ -184,6 +197,46 @@ standoff that still reads as parallel.
 **That risk is untested.** Nothing in this repo has run in Studio, so how the avatar actually
 renders at 1,156 studs is unknown. `TUNE.fovDeg` is the single number to change: 4 costs 867
 studs and 5.2 px, 6 costs 578 studs and 7.7 px.
+
+## Editing the maps
+
+**`F2` in demo 3 or demo 4 opens a live map editor.**
+
+These illusions are composed by eye. The maths that makes two points coincide is exact and
+easy; deciding *which* two things should appear to touch, from *which* angle, so the shot reads
+well, is a judgement about a picture. Authoring those numbers blind produces geometry that is
+arithmetically perfect and visually wrong — which is what happened.
+
+| key | |
+| --- | --- |
+| `F2` | open / close the editor |
+| `TAB` | select the next entry (one per surface-and-seam) |
+| `←` `→` `↑` `↓` | move the selected surface **on screen** |
+| `PGUP` `PGDN` | move it **in depth** — free under a parallel projection, and the readout proves it |
+| `[` `]` | step size, 0.25 → 5 studs |
+| `ENTER` | **SOLVE** |
+| `BACKSPACE` | undo all moves to this surface |
+| `P` | print the edits as paste-ready Luau |
+
+**SOLVE is the point of the tool.** Frame the shot you want, select the surface that should
+appear to meet another, and press it: the surface moves the exact amount that puts its seam point
+on the ray from your eye through the partner — the same pixel, from where you are standing,
+keeping its own distance from the eye so it moves as little as it can. No eyeballing, no fitting.
+
+The readout is measured in the **real** projection (the angle at the eye, shown in pixels of your
+viewport), not an idealised one — so it cannot tell you a seam is coincident while you can see
+that it is not.
+
+A surface is one Model — slab, skirt and seam markers together, with the seam Attachments on
+the slab — so moving a walkway moves everything on it and the geometry can never desync from
+the graph. Every edit rebuilds whatever was cached (demo 3's settled graph, demo 4's sixteen
+baked graphs).
+
+Nothing writes to disk — a client cannot. `P` prints a block to the Output; paste the numbers
+back into `Demo3/Building.luau` or `Demo4/Level.luau`, which is what Rojo syncs.
+
+**Both demos also print, at boot, the exact camera angle at which each authored seam
+coincides** — so the angle to look from is a stated fact rather than something to hunt for.
 
 ---
 
