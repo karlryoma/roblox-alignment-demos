@@ -8,7 +8,7 @@ not a shipped game: client-only, no server authority, placeholder art on purpose
 | --- | --- | --- |
 | 1 | **Item inspection** — a puzzle box turned in the hand, near-orthographic | built |
 | 2 | **Room-scale align-to-unlock** — walk a room, two-step chain | built |
-| 3 | **Impossible connector** — align to create a real bridge, then walk it | built |
+| 3 | **Dwell to weave** — hold the camera still and coincident surfaces connect | built |
 | 4 | **Monument Valley traversal** — baked screen-space connectivity, rotate the world | built |
 
 ## Running it
@@ -102,46 +102,48 @@ Correspondingly, demo 1's `atan2`-over-`acos` argument is a FOV-1 precision argu
 because a second hand-written test is exactly the two-sources-of-truth failure this codebase
 warns about, and because the *predicates* are the part that matters.
 
-## Demo 3 — Impossible connector
+## Demo 3 — Dwell to weave
 
 <!-- GIF: demo3.gif -->
 
-Walk with WASD · drag to orbit · click or `E` to engage when armed · `R` reset · `Q` leave.
+Walk with WASD · drag to orbit · **hold the camera still to weave** · `R` reset · `Q` leave.
 
-Demo 2 proved alignment can *gate* an interaction. This is the payoff: alignment **creates
-real geometry you walk across**. Line up two sockets 40 studs apart in depth, commit, and a
-connector materialises along the true 3D line between them. Then the camera stops mattering —
-the bridge is real, it stays, and you cross it with your actual avatar. Crossing exposes a
-second pair, and a second connector reaches the goal.
+Your own Roblox character, walking a Monument Valley-ish building with normal Humanoid
+movement. Two surfaces that **coincide on screen are connected** — but only once the camera
+settles. While you are turning, the world is inert. Stop for a beat and the coincidences
+crystallise: the seams light up, and walking into one continues you onto the surface that
+looked joined, which is somewhere else entirely in world space.
 
-**This is the only demo of the four whose result is coherent from every camera in the
-server.** Demos 1, 2 and 4 are camera-relative and inherently single-viewer: the illusion
-lives inside one player's projection, and a second player standing beside them sees nothing.
-Here the alignment is merely the *trigger*; what it produces is world-space geometry every
-client would agree about. That is the difference between a trick and a mechanic that could
-ship in a multiplayer game.
+There is no commit button and no authored anchor pair to line up. The building's whole
+connectivity is a function of the camera angle — which is what separates this from demo 2,
+where alignment unlocks one authored thing. Here **alignment is the level's topology**.
 
-**Owning the seam.** From the locking seat the connector is foreshortened to nothing — that
-is the illusion. From every other angle it is a long beam hanging in space, and no amount of
-care hides that. So it is deliberately **stylised**: floating slabs with a Neon spine that
-assemble in sequence from the near anchor outward. A concrete plank bridge read off-angle
-looks like a bug; a light bridge that built itself looks like something you cast. The
-materialisation also covers the single frame in which the geometry appears.
+**Why not FOV 70.** A crossing jumps the character ~21 studs in depth. Under a close
+perspective camera that would visibly pop its size, and so would every other relationship in
+frame. `H = 2·D·tan(FOV/2)`, so FOV 6 at 400 studs frames a ~42-stud-tall view; a 20.8-stud
+depth jump then changes apparent size by **5.2%** — about 3 px on a 60 px character, gone in a
+single frame. A deliberate middle ground between demo 1's FOV 1 at 372 studs and a normal game
+camera, and 400 studs is comfortably inside safe render distance.
 
-**Anchors differ in depth, never in height.** The connector is a real 3D line, so a pair
-separated vertically would look flat from the locking seat and be a steep ramp in world
-space — still walkable (`Humanoid.MaxSlopeAngle` defaults to 89°) but wrong to walk. Both
-pairs are dead level, and the slope is asserted at boot. Depth separation is also the
-*stronger* illusion, because depth is exactly what the eye cannot judge.
+**The camera frames the building, not the character.** If it followed the avatar it would be
+dragged 21 studs along the view ray on every crossing and the whole scene would lurch. Framing
+the building means only the character changes depth, by its own small amount.
 
-**A deviation worth naming:** the subject sphere here is sized on the marker art rather than
-the usual half-the-baseline. With a 40-stud baseline in an open exterior, a half-baseline
-sphere is 21 studs across the middle of the chasm and the orbit camera — which swings ~10.5
-studs past the player — enters it during ordinary walking, where `probe` fails closed and the
-HUD would shout STEP BACK for no reason. The normalisation is valid for any radius (`sepNorm`
-reduces to perpendicular-offset / 2r, with viewing distance cancelling either way); the radius
-only sets the scale. Clearance from every standable spot is asserted numerically: +3.5 studs
-for stage 1, +3.0 for stage 2.
+**The crossing is a pure translation**, applied in one frame with no interpolation, and the
+velocity is deliberately *not* zeroed — smooth movement is the entire point. That is only legal
+because paired seam nodes share a surface normal and have **opposite outward directions**;
+`Seam.orientationFault` asserts it at boot, because a mismatched pair would silently mangle
+velocity.
+
+**The seams are exact, not fitted.** Under a parallel projection two points coincide precisely
+when their difference is parallel to the view direction, so at the isometric pitch a join is an
+offset of (k,k,k): `A_end → B_start` is (12,12,12) and lives at yaw 45°; `B_end → C_start` is
+(−8,−8,8) and lives at yaw 135°. Neither is live at the other's angle, so the route needs both.
+
+**Deliberate limitation: every walkable surface is a floor.** Roblox gravity is global −Y with
+no per-character override, so Monument Valley's walls-become-floors moments are out unless the
+Humanoid is abandoned — which is the one thing this design exists to keep. Most MV traversal is
+flat walkway anyway, so the illusion still reads.
 
 ## Demo 4 — Monument Valley traversal
 
@@ -203,6 +205,7 @@ perspective residual at a virtual edge is 1.2 px at 1080p, and zero at frame cen
 | `src/shared/Spin.luau` | View-sphere state; one integrator for drag, coast and snap. |
 | `src/shared/Damp.luau` | Framerate-independent smoothing. Every constant is a time constant. |
 | `src/client/init.client.luau` | **The shell.** The only LocalScript: menu, hosting, respawn, global restores. |
+| `src/shared/Seam.luau` | Screen-space traversal: exact ortho projection, seam graph, the crossing. Demos 3 and 4. |
 | `src/client/Demo1/`…`Demo4/` | The demos. Each is a controller with `start(ctx)` / `stop()`. |
 | `src/client/Demo4/Graph.luau` | Exact ortho projection, the graph baker, BFS. Knows nothing about `Align`. |
 | `src/replicatedFirst/` | The loading screen. Requires nothing from `src/client`. |
