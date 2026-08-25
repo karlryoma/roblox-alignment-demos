@@ -13,6 +13,13 @@
 	that line is what changes an alignment. So the nudge keys are screen-relative: left/right and
 	up/down move the picture, in/out moves depth nearly for free.
 
+	WHICH IS ALSO HOW YOU CHOOSE WHAT IS IN FRONT. Roblox has no per-object draw order: occlusion
+	is decided entirely by distance from the camera. So "put this walkway in front of that one" is
+	the same operation as "move it toward the eye" -- and under these near-parallel projections
+	that is nearly free in screen terms. The panel reports the depth order and what it costs in
+	apparent size, and FLIP mirrors a surface to the other side of its partner: same pixels, other
+	side of the seam.
+
 	SOLVE is the point of the whole tool. Frame the shot you want, select the surface that should
 	appear to meet another, press it, and the surface moves the exact amount that puts its seam
 	point on the ray from your eye through the partner -- the same pixel, from where you are
@@ -108,7 +115,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local panel = Instance.new("Frame")
 	panel.AnchorPoint = Vector2.new(0, 1)
 	panel.Position = UDim2.new(0, 24, 1, -24)
-	panel.Size = UDim2.fromOffset(430, 210)
+	panel.Size = UDim2.fromOffset(450, 232)
 	panel.BackgroundColor3 = Color3.fromRGB(16, 18, 23)
 	panel.BackgroundTransparency = 0.12
 	panel.BorderSizePixel = 0
@@ -142,13 +149,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local who = label(34, 14, INK)
 	local readout = label(56, 13, DIM)
 	local readout2 = label(74, 13, DIM)
-	local help = label(102, 12, DIM)
+	local depthOut = label(92, 13, DIM)
+	local help = label(116, 12, DIM)
 	help.Size = UDim2.fromOffset(400, 100)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
 		"[  ]  select entry              -  =  step size",
-		"ARROWS  move on screen          PGUP/PGDN  move in depth",
-		"ENTER  SOLVE: put this seam on the ray through its partner",
+		"ARROWS  move on screen          PGUP/PGDN  move toward / away from the eye",
+		"ENTER  SOLVE (same pixel)       Z  FLIP which one is in front",
 		"BACKSPACE  undo all moves to this surface",
 		"P  print the edits as paste-ready Luau",
 	}, "\n")
@@ -166,6 +174,15 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local camCF = cam:GetRenderCFrame()
 		local deg = Seam.separationDeg(camCF.Position, seam.node.WorldPosition, seam.partner.WorldPosition)
 		return deg, Seam.degToPixels(deg, cam.FieldOfView, cam.ViewportSize.Y)
+	end
+
+	--[[
+		Distance from the eye to each end of the seam. The nearer one is the one drawn in front,
+		because that is the only thing Roblox sorts on.
+	]]
+	local function depths(seam: EditorSeam): (number, number)
+		local eye = cam:GetRenderCFrame().Position
+		return (seam.node.WorldPosition - eye).Magnitude, (seam.partner.WorldPosition - eye).Magnitude
 	end
 
 	local function refresh()
@@ -192,9 +209,26 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			readout2.Text = if px < 2
 				then "drawn on the same pixel from here"
 				else "ENTER solves it from where you are standing"
+
+			--[[ Depth order is the whole of "what is in front of what" in Roblox, and the size
+			     penalty is what it costs: a surface pulled toward the eye is drawn that much
+			     larger, which at a wide FOV is the thing that gives the trick away. ]]
+			local mine, theirs = depths(seam)
+			local gap = mine - theirs
+				-- The ratio of the two distances is the ratio of their drawn sizes.
+		local scale = if theirs > 1e-3 then math.abs(gap) / theirs * 100 else 0
+			--[[ The percentage is not decoration: it is exactly how much the avatar's apparent size
+			     jumps when it crosses this seam, because that pop IS the depth ratio. Widen the gap
+			     to reorder the drawing and you widen the pop by the same amount. ]]
+			depthOut.Text = ("in front: %s, by %.1f studs · crossing pops the avatar %.1f%%"):format(
+				if gap < 0 then seam.node.Name else seam.partner.Name,
+				math.abs(gap),
+				scale
+			)
 		else
 			readout.Text = "this surface carries no seam"
 			readout2.Text = ""
+			depthOut.Text = ""
 		end
 	end
 
@@ -238,6 +272,41 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local reach = (seam.node.WorldPosition - eye).Magnitude
 		local wanted = eye + toPartner.Unit * reach
+		moveBy(wanted - seam.node.WorldPosition)
+	end
+
+	--[[
+		FLIP: mirror this surface to the other side of its partner along the eye ray, so whichever
+		was in front now is not. The screen ray is unchanged, so the picture keeps its alignment;
+		only the occlusion order and the apparent size change. That is the only lever there is --
+		Roblox sorts by distance and nothing else.
+	]]
+	local function flipDepth()
+		local target = current()
+		local seam = if target then target.seams[1] else nil
+		if not target or not seam then
+			return
+		end
+		local gate = options.canSolve
+		if gate and not gate() then
+			readout2.Text = "cannot flip from here -- the view is not settled"
+			return
+		end
+		local eye = cam:GetRenderCFrame().Position
+		local toNode = seam.node.WorldPosition - eye
+		local mine, theirs = depths(seam)
+		if toNode.Magnitude < 1e-3 or theirs < 1e-3 then
+			return
+		end
+		-- Mirrored across the partner's distance: same direction from the eye, other side of it.
+		local wantedDistance = 2 * theirs - mine
+		if wantedDistance < 5 then
+			-- The mirror would land on top of the camera, or behind it. Refuse rather than fling
+			-- the surface through the lens.
+			readout2.Text = "cannot flip: the far side is behind the camera -- move it closer first"
+			return
+		end
+		local wanted = eye + toNode.Unit * wantedDistance
 		moveBy(wanted - seam.node.WorldPosition)
 	end
 
@@ -314,6 +383,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				moveBy(-camCF.LookVector * step)
 			elseif code == Enum.KeyCode.Return then
 				solve()
+			elseif code == Enum.KeyCode.Z then
+				flipDepth()
 			elseif code == Enum.KeyCode.Backspace then
 				undo()
 			elseif code == Enum.KeyCode.P then

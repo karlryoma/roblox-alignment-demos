@@ -215,9 +215,22 @@ arithmetically perfect and visually wrong — which is what happened.
 | `←` `→` `↑` `↓` | move the selected surface **on screen** |
 | `PGUP` `PGDN` | move it **in depth** — free under a parallel projection, and the readout proves it |
 | `-` `=` | step size, 0.25 → 5 studs |
-| `ENTER` | **SOLVE** |
+| `ENTER` | **SOLVE** — put this seam on the same pixel as its partner |
+| `Z` | **FLIP** — swap which surface draws in front |
 | `BACKSPACE` | undo all moves to this surface |
 | `P` | print the edits as paste-ready Luau |
+
+**Choosing what draws in front.** Roblox has no per-object draw order — occlusion is decided
+entirely by distance from the camera. So "put this walkway in front of that one" *is* "move it
+toward the eye", which under these near-parallel projections barely touches the picture:
+`PGUP`/`PGDN` move the selected surface along the view axis, and `Z` mirrors it to the other
+side of its partner in one press. Verified: a flip leaves the seam's screen separation bit-identical
+(0.0099° before and after) and only the occlusion order changes.
+
+It is not free, though, and the panel says what it costs. The ratio of the two distances is the
+ratio of their drawn sizes, which is *also* exactly how much the avatar's apparent size pops when
+it crosses that seam. Demo 3's authored 20.8-stud gap costs 5%; flipping it to a 62-stud gap
+costs 15%, which is visible. The readout shows the live figure so the trade is in front of you.
 
 **SOLVE is the point of the tool.** Frame the shot you want, select the surface that should
 appear to meet another, and press it: the surface moves the exact amount that puts its seam point
