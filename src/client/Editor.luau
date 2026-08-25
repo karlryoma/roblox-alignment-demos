@@ -16,9 +16,19 @@
 	WHICH IS ALSO HOW YOU CHOOSE WHAT IS IN FRONT. Roblox has no per-object draw order: occlusion
 	is decided entirely by distance from the camera. So "put this walkway in front of that one" is
 	the same operation as "move it toward the eye" -- and under these near-parallel projections
-	that is nearly free in screen terms. The panel reports the depth order and what it costs in
-	apparent size, and FLIP mirrors a surface to the other side of its partner: same pixels, other
-	side of the seam.
+	that is nearly free in screen terms.
+
+	ORDERING IS A SET OF CONSTRAINTS, NOT A NUDGE. "In front of the pole but behind that platform"
+	is a statement about three objects at once, and satisfying one half at a time silently undoes
+	the other. So IN FRONT OF and BEHIND SET constraints, and both are solved together every time
+	either changes: the tool computes the interval of depths that satisfies both and moves the
+	surface the shortest distance into it. When the interval is empty it says so, with the numbers
+	-- because "there is no room between these two" is a fact about the level the author needs,
+	not an error to hide.
+
+	Depth is compared as a RANGE (the object's whole extent along the view axis), never a centre
+	point: a platform whose centre is nearer can still have its far end poking through the thing
+	it is supposed to sit in front of.
 
 	SOLVE is the point of the whole tool. Frame the shot you want, select the surface that should
 	appear to meet another, press it, and the surface moves the exact amount that puts its seam
@@ -70,6 +80,13 @@ export type Handle = {
 	destroy: () -> (),
 }
 
+--[[ Anything the ordering commands can be placed relative to: surfaces, poles, scenery. The demo
+     curates this -- a raw descendant walk would bury the list in skirts and marker bars. ]]
+export type Reference = {
+	name: string,
+	instance: Instance,
+}
+
 export type Options = {
 	--[[ Called after any edit, so the demo can rebuild whatever it caches (a settled graph, a
 	     bake). Edits are rare and this is cheap. ]]
@@ -82,6 +99,7 @@ export type Options = {
 	--[[ Whether authoring is legal right now -- demo 4 says no mid-rotation, because the camera is
 	     then showing an angle the game can never settle at. ]]
 	canSolve: (() -> boolean)?,
+	references: { Reference }?,
 	camera: Camera,
 	playerGui: Instance,
 }
@@ -115,7 +133,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local panel = Instance.new("Frame")
 	panel.AnchorPoint = Vector2.new(0, 1)
 	panel.Position = UDim2.new(0, 24, 1, -24)
-	panel.Size = UDim2.fromOffset(450, 232)
+	panel.Size = UDim2.fromOffset(470, 340)
 	panel.BackgroundColor3 = Color3.fromRGB(16, 18, 23)
 	panel.BackgroundTransparency = 0.12
 	panel.BorderSizePixel = 0
@@ -150,19 +168,74 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local readout = label(56, 13, DIM)
 	local readout2 = label(74, 13, DIM)
 	local depthOut = label(92, 13, DIM)
-	local help = label(116, 12, DIM)
-	help.Size = UDim2.fromOffset(400, 100)
+	local stackTitle = label(114, 12, WARN)
+	stackTitle.Text = "DEPTH STACK  (nearest the camera first)"
+	local stackOut = label(130, 12, DIM)
+	stackOut.Size = UDim2.fromOffset(430, 78)
+	stackOut.TextYAlignment = Enum.TextYAlignment.Top
+	local help = label(214, 12, DIM)
+	help.Size = UDim2.fromOffset(430, 110)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
 		"[  ]  select entry              -  =  step size",
-		"ARROWS  move on screen          PGUP/PGDN  move toward / away from the eye",
-		"ENTER  SOLVE (same pixel)       Z  FLIP which one is in front",
-		"BACKSPACE  undo all moves to this surface",
-		"P  print the edits as paste-ready Luau",
+		"ARROWS  move on screen          PGUP/PGDN  toward / away from the eye",
+		"ENTER  SOLVE (same pixel)       Z  FLIP across the seam partner",
+		"; '  choose reference           HOME  must be IN FRONT OF it",
+		"\\  clear constraints           END   must be BEHIND it",
+		"BACKSPACE  undo this surface    P  print the edits",
 	}, "\n")
 
 	local function current(): Target?
 		return targets[selected]
+	end
+
+	local references: { Reference } = options.references or {}
+	local reference = 1
+	--[[ The two ordering constraints, solved together. Kept per selected surface, because they
+	     describe that surface's place in the stack and nothing else. ]]
+	local mustBeInFrontOf: { [Model]: Reference } = {}
+	local mustBeBehind: { [Model]: Reference } = {}
+
+	--[[
+		How much of the view axis an object occupies: the nearest and furthest depth over its whole
+		extent. A range, not a centre -- an object whose centre is nearer can still have its far
+		end poking through whatever it is meant to sit in front of.
+	]]
+	local function depthRange(inst: Instance, camCF: CFrame): (number, number)
+		local cf: CFrame, size: Vector3
+		if inst:IsA("Model") then
+			cf, size = inst:GetBoundingBox()
+		elseif inst:IsA("BasePart") then
+			cf, size = inst.CFrame, inst.Size
+		else
+			return math.huge, -math.huge
+		end
+		local half = size * 0.5
+		local lo, hi = math.huge, -math.huge
+		for _, sx in { -1, 1 } do
+			for _, sy in { -1, 1 } do
+				for _, sz in { -1, 1 } do
+					local at = cf * CFrame.new(half.X * sx, half.Y * sy, half.Z * sz)
+					local depth = -(camCF:PointToObjectSpace(at.Position).Z)
+					lo = math.min(lo, depth)
+					hi = math.max(hi, depth)
+				end
+			end
+		end
+		return lo, hi
+	end
+
+	--[[ The direction to slide along so the thing being composed keeps its pixel: the ray from the
+	     eye through the seam point, or through the model's centre when there is no seam. ]]
+	local function slideAxis(target: Target): (Vector3, Vector3)
+		local eye = cam:GetRenderCFrame().Position
+		local seam = target.seams[1]
+		local anchor = if seam then seam.node.WorldPosition else target.model:GetPivot().Position
+		local dir = anchor - eye
+		if dir.Magnitude < 1e-3 then
+			return cam:GetRenderCFrame().LookVector, anchor
+		end
+		return dir.Unit, anchor
 	end
 
 	--[[
@@ -185,12 +258,52 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return (seam.node.WorldPosition - eye).Magnitude, (seam.partner.WorldPosition - eye).Magnitude
 	end
 
+	local function refreshStack(target: Target)
+		--[[ The constraints are shown persistently, not only in the last message: they are state,
+		     and state the author cannot see is state they will fight. ]]
+		local front = mustBeInFrontOf[target.model]
+		local back = mustBeBehind[target.model]
+		if front or back then
+			stackTitle.Text = ("DEPTH STACK   must be%s%s%s"):format(
+				if front then ` in front of {front.name}` else "",
+				if front and back then " and" else "",
+				if back then ` behind {back.name}` else ""
+			)
+		else
+			stackTitle.Text = "DEPTH STACK  (nearest the camera first)"
+		end
+		if #references == 0 then
+			stackOut.Text = "  (this demo lists no reference objects)"
+			return
+		end
+		local camCF = cam:GetRenderCFrame()
+		local rows: { { name: string, lo: number, hi: number, isRef: boolean } } = {}
+		for i, ref in references do
+			local lo, hi = depthRange(ref.instance, camCF)
+			if lo ~= math.huge then
+				table.insert(rows, { name = ref.name, lo = lo, hi = hi, isRef = i == reference })
+			end
+		end
+		table.sort(rows, function(a, b)
+			return a.lo < b.lo
+		end)
+		local myLo = select(1, depthRange(target.model, camCF))
+		local lines: { string } = {}
+		for _, row in rows do
+			local mark = if row.isRef then ">" else " "
+			local mine = if math.abs(row.lo - myLo) < 0.01 then "  <= selected" else ""
+			table.insert(lines, ("%s %-22s %6.0f .. %6.0f studs%s"):format(mark, row.name, row.lo, row.hi, mine))
+		end
+		stackOut.Text = table.concat(lines, "\n")
+	end
+
 	local function refresh()
 		local target = current()
 		if not target then
 			who.Text = "no editable surfaces"
 			return
 		end
+		refreshStack(target)
 		local offset = moved[target.model] or Vector3.zero
 		who.Text = ("[%d/%d] %s   step %.2f   moved (%.2f, %.2f, %.2f)"):format(
 			selected,
@@ -310,6 +423,92 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		moveBy(wanted - seam.node.WorldPosition)
 	end
 
+	--[[
+		Solve BOTH ordering constraints at once and move the shortest distance that satisfies them.
+
+		Working in "depth of my nearest face", the two constraints are intervals:
+		  in front of R  =>  my FAR face must clear R's near face   =>  myLo <= R.lo - margin - span
+		  behind R       =>  my NEAR face must clear R's far face   =>  myLo >= R.hi + margin
+		Intersect, clamp the current value into it -- and when the intersection is empty, say so
+		with the numbers rather than satisfying one and silently breaking the other.
+	]]
+	local MARGIN = 0.5
+	local function applyConstraints(): boolean
+		local target = current()
+		if not target then
+			return false
+		end
+		local gate = options.canSolve
+		if gate and not gate() then
+			readout2.Text = "cannot reorder from here -- the view is not settled"
+			return false
+		end
+		local front = mustBeInFrontOf[target.model]
+		local back = mustBeBehind[target.model]
+		if not front and not back then
+			return false
+		end
+
+		local camCF = cam:GetRenderCFrame()
+		local myLo, myHi = depthRange(target.model, camCF)
+		if myLo == math.huge then
+			return false
+		end
+		local span = myHi - myLo
+
+		local dir = slideAxis(target)
+		local perStud = dir:Dot(camCF.LookVector)
+		if math.abs(perStud) < 1e-3 then
+			readout2.Text = "cannot reorder: this surface is edge-on to the view axis"
+			return false
+		end
+
+		local lowest, highest = -math.huge, math.huge
+		if back then
+			local _, refHi = depthRange(back.instance, camCF)
+			lowest = math.max(lowest, refHi + MARGIN)
+		end
+		if front then
+			local refLo = depthRange(front.instance, camCF)
+			highest = math.min(highest, refLo - MARGIN - span)
+		end
+
+		if lowest > highest then
+			readout2.Text = ("no room: %s leaves %.1f studs and this surface is %.1f deep"):format(
+				if front and back then `{back.name} .. {front.name}` else "that pair",
+				highest - lowest + span,
+				span
+			)
+			return false
+		end
+
+		local wanted = math.clamp(myLo, lowest, highest)
+		moveBy(dir * ((wanted - myLo) / perStud))
+		readout2.Text = ("ordered: %s%s%s"):format(
+			if front then `in front of {front.name}` else "",
+			if front and back then " · " else "",
+			if back then `behind {back.name}` else ""
+		)
+		return true
+	end
+
+	local function order(inFront: boolean)
+		local target = current()
+		local ref = references[reference]
+		if not target or not ref then
+			return
+		end
+		-- A constraint, not a one-shot move: both are re-solved together so the second can never
+		-- silently undo the first.
+		if inFront then
+			mustBeInFrontOf[target.model] = ref
+		else
+			mustBeBehind[target.model] = ref
+		end
+		applyConstraints()
+		refresh()
+	end
+
 	local function undo()
 		local target = current()
 		if not target then
@@ -385,6 +584,24 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				solve()
 			elseif code == Enum.KeyCode.Z then
 				flipDepth()
+			elseif code == Enum.KeyCode.Semicolon then
+				reference = ((reference - 2) % math.max(#references, 1)) + 1
+				refresh()
+			elseif code == Enum.KeyCode.Quote then
+				reference = (reference % math.max(#references, 1)) + 1
+				refresh()
+			elseif code == Enum.KeyCode.Home then
+				order(true)
+			elseif code == Enum.KeyCode.End then
+				order(false)
+			elseif code == Enum.KeyCode.BackSlash then
+				local target = current()
+				if target then
+					mustBeInFrontOf[target.model] = nil
+					mustBeBehind[target.model] = nil
+					readout2.Text = "constraints cleared"
+					refresh()
+				end
 			elseif code == Enum.KeyCode.Backspace then
 				undo()
 			elseif code == Enum.KeyCode.P then

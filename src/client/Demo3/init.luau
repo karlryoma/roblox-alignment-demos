@@ -451,9 +451,21 @@ function Demo3.start(ctx: Shell.Context): boolean
 		end
 
 		local editorFreeze: (() -> ())? = nil
+		--[[ What the ordering commands can place things relative to: every walkable surface and
+		     every pole. Curated rather than a descendant walk, which would bury the list in
+		     skirts and marker bars. ]]
+		local editorReferences: { Editor.Reference } = {}
+		for name, model in building.models do
+			table.insert(editorReferences, { name = `surface {name}`, instance = model :: Instance })
+		end
+		for _, pole in building.occluders:GetChildren() do
+			table.insert(editorReferences, { name = `pole {pole.Name}`, instance = pole :: Instance })
+		end
+
 		local editor = Editor.new(editorTargets, {
 			camera = cam,
 			playerGui = ctx.playerGui,
+			references = editorReferences,
 			-- A moved surface invalidates whatever was settled: rebuild it so the lit seams and
 			-- the readout always describe the geometry as it is now.
 			onChanged = function()

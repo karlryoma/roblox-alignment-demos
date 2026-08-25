@@ -217,6 +217,9 @@ arithmetically perfect and visually wrong — which is what happened.
 | `-` `=` | step size, 0.25 → 5 studs |
 | `ENTER` | **SOLVE** — put this seam on the same pixel as its partner |
 | `Z` | **FLIP** — swap which surface draws in front |
+| `;` `'` | choose a reference object from the depth stack |
+| `HOME` / `END` | constrain: must be **in front of** / **behind** the reference |
+| `\` | clear this surface's ordering constraints |
 | `BACKSPACE` | undo all moves to this surface |
 | `P` | print the edits as paste-ready Luau |
 
@@ -226,6 +229,19 @@ toward the eye", which under these near-parallel projections barely touches the 
 `PGUP`/`PGDN` move the selected surface along the view axis, and `Z` mirrors it to the other
 side of its partner in one press. Verified: a flip leaves the seam's screen separation bit-identical
 (0.0099° before and after) and only the occlusion order changes.
+
+**Ordering against named things.** "In front of the pole but behind that platform" is a statement
+about three objects, and satisfying one half at a time silently undoes the other. So `HOME` and
+`END` set *constraints* rather than performing one-shot moves, and both are re-solved together
+every time either changes: the editor intersects the two allowed depth intervals and moves the
+surface the shortest distance into the result. The panel shows a **depth stack** — every surface
+and pole sorted by distance from the eye — with the selection and the active reference marked.
+
+When the two constraints cannot both hold it says so with the numbers, rather than quietly
+breaking one. That is common and it is a fact about the level, not an error: in demo 3, asking a
+platform to sit in front of `col-B` *and* behind surface A is impossible, because the pole is
+already nearer than A's back face — the pair leaves −20 studs of room for an 11-stud-deep
+platform. Widening the gap, or shrinking the platform, is then the real fix.
 
 It is not free, though, and the panel says what it costs. The ratio of the two distances is the
 ratio of their drawn sizes, which is *also* exactly how much the avatar's apparent size pops when

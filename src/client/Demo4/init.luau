@@ -483,9 +483,21 @@ function Demo4.start(ctx: Shell.Context): boolean
 			end
 		end
 
+		--[[ What the ordering commands can place things relative to: every walkable surface and
+		     every pole. Curated rather than a descendant walk, which would bury the list in
+		     skirts and marker bars. ]]
+		local editorReferences: { Editor.Reference } = {}
+		for name, model in level.models do
+			table.insert(editorReferences, { name = `surface {name}`, instance = model :: Instance })
+		end
+		for _, pole in level.occluders:GetChildren() do
+			table.insert(editorReferences, { name = `pole {pole.Name}`, instance = pole :: Instance })
+		end
+
 		local editor = Editor.new(editorTargets, {
 			camera = cam,
 			playerGui = ctx.playerGui,
+			references = editorReferences,
 			-- Sixteen graphs are a snapshot of the geometry, so a moved surface invalidates all of
 			-- them. Re-baking is milliseconds and it keeps the lit seams honest.
 			onChanged = function()
