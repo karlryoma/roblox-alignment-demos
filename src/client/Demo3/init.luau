@@ -500,7 +500,10 @@ function Demo3.start(ctx: Shell.Context): boolean
 			if processed then
 				return
 			end
-			if input.KeyCode == Enum.KeyCode.F2 then
+			--[[ M, not F2. Studio binds F2 to Rename and swallows it before the game sees it, and
+			     this is a tool you only ever use inside Studio. F2 stays as an alias for anyone
+			     running a published place. ]]
+			if input.KeyCode == Enum.KeyCode.M or input.KeyCode == Enum.KeyCode.F2 then
 				-- Everything the mode change implies lives in the editor's own open/close hooks,
 				-- so a later edit cannot quietly re-arm what this switched off.
 				editor.toggle()
@@ -552,6 +555,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 				)
 			end
 			print(`[demo3] {#nodes} nodes, {found} intended seams, all orientation-checked`)
+			print("[demo3] press M in-game for the map editor (F2 also works outside Studio)")
 			print(("[demo3] fitted standoff %.0f studs"):format(opts.distance))
 
 			--[[
@@ -689,7 +693,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 			RunService:UnbindFromRenderStep(bind)
 		end)
 
-		hud.setHint("hold the camera still to weave · F2 edits the map")
+		hud.setHint("hold the camera still to weave · M edits the map")
 		hud.fade(1, 0.45)
 	end)
 end

@@ -200,7 +200,8 @@ studs and 5.2 px, 6 costs 578 studs and 7.7 px.
 
 ## Editing the maps
 
-**`F2` in demo 3 or demo 4 opens a live map editor.**
+**`M` in demo 3 or demo 4 opens a live map editor.** (Not `F2` — Studio binds that to Rename
+and swallows it before the game sees it. `F2` still works in a published place.)
 
 These illusions are composed by eye. The maths that makes two points coincide is exact and
 easy; deciding *which* two things should appear to touch, from *which* angle, so the shot reads
@@ -209,11 +210,11 @@ arithmetically perfect and visually wrong — which is what happened.
 
 | key | |
 | --- | --- |
-| `F2` | open / close the editor |
-| `TAB` | select the next entry (one per surface-and-seam) |
+| `M` | open / close the editor |
+| `[` `]` | select entry (one per surface-and-seam) |
 | `←` `→` `↑` `↓` | move the selected surface **on screen** |
 | `PGUP` `PGDN` | move it **in depth** — free under a parallel projection, and the readout proves it |
-| `[` `]` | step size, 0.25 → 5 studs |
+| `-` `=` | step size, 0.25 → 5 studs |
 | `ENTER` | **SOLVE** |
 | `BACKSPACE` | undo all moves to this surface |
 | `P` | print the edits as paste-ready Luau |

@@ -414,7 +414,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 			lastSafe = level.spawnCF
 			setWalkable(true)
 			installGraph()
-			hud.setHint("← → turn the view · F turns the bridge · F2 edits the map · R reset · Q to leave")
+			hud.setHint("← → turn the view · F turns the bridge · M edits the map · R reset · Q to leave")
 		end
 
 		--------------------------------------------------------------------------------
@@ -518,7 +518,9 @@ function Demo4.start(ctx: Shell.Context): boolean
 			end
 			local code = input.KeyCode
 
-			if code == Enum.KeyCode.F2 then
+			--[[ M, not F2. Studio binds F2 to Rename and eats it before the game sees it, and this
+			     is a tool you only ever use inside Studio. F2 remains an alias elsewhere. ]]
+			if code == Enum.KeyCode.M or code == Enum.KeyCode.F2 then
 				-- Everything the mode change implies lives in the editor's open/close hooks.
 				editor.toggle()
 				return
@@ -642,11 +644,12 @@ function Demo4.start(ctx: Shell.Context): boolean
 				warn(`[demo4] {soloSolve} reaches the goal on its own -- rotation is decorative`)
 			else
 				print("[demo4] no single state reaches the goal: both rotations are required")
+				print("[demo4] press M in-game for the map editor (F2 also works outside Studio)")
 			end
 		end
 
 		installGraph()
-		hud.setHint("← → turn the view · F turns the bridge · F2 edits the map · R reset · Q to leave · wants high graphics")
+		hud.setHint("← → turn the view · F turns the bridge · M edits the map · R reset · Q to leave · wants high graphics")
 
 		--------------------------------------------------------------------------------
 		-- THE FRAME LOOP
