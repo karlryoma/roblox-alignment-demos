@@ -573,6 +573,12 @@ function Demo4.start(ctx: Shell.Context): boolean
 				return
 			end
 
+			--[[ Past the view turn, an open editor owns the keyboard: F would drive the rotor
+			     against the very home pose being edited, and Q/R would drop the work. ]]
+			if editor.isOpen() then
+				return
+			end
+
 			if code == Enum.KeyCode.F then
 				beginRotor()
 			elseif code == Enum.KeyCode.R then

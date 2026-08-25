@@ -540,7 +540,17 @@ function Demo3.start(ctx: Shell.Context): boolean
 				-- Everything the mode change implies lives in the editor's own open/close hooks,
 				-- so a later edit cannot quietly re-arm what this switched off.
 				editor.toggle()
-			elseif input.KeyCode == Enum.KeyCode.R then
+				return
+			end
+
+			--[[ While the editor is open every other key here belongs to it. Without this, Q would
+			     still quit the demo mid-edit and R would throw away the work. One guard beats
+			     teaching each branch about the editor. ]]
+			if editor.isOpen() then
+				return
+			end
+
+			if input.KeyCode == Enum.KeyCode.R then
 				resetQueued = true
 			elseif input.KeyCode == Enum.KeyCode.Q then
 				doExit()

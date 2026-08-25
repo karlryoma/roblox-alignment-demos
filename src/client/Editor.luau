@@ -197,7 +197,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	help.Size = UDim2.fromOffset(470, 60)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
-		"MOVE   arrows  across the screen        PgUp / PgDn  toward / away from camera",
+		"MOVE   arrows  across the screen        K / I  toward / away from camera",
 		"       -  =  step size                  Z  swap this join front / back",
 		"       BACKSPACE  undo this piece       P  print the numbers to paste back",
 	}, "\n")
@@ -500,7 +500,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				if back then ` behind {back.name}` else ""
 			)
 		else
-			orderOut.Text = ("  HOME  put this in front of %s        ; '  pick another\n  END   put this behind %s"):format(
+			orderOut.Text = ("  F  put this in front of %s        ; '  pick another\n  B  put this behind %s"):format(
 				refName,
 				refName
 			)
@@ -810,10 +810,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				moveBy(camCF.UpVector * step)
 			elseif code == Enum.KeyCode.Down then
 				moveBy(-camCF.UpVector * step)
-			elseif code == Enum.KeyCode.PageUp then
-				-- Along the view axis: free under a parallel projection, and the readout proves it.
+			elseif code == Enum.KeyCode.I then
+				--[[ Along the view axis: free under a parallel projection, and the readout proves it.
+				     I/K, not PageUp/PageDown -- Studio claims those for the Explorer and yanks focus
+				     out of the play view before the game ever sees the key. Same reason as F2. ]]
 				moveBy(camCF.LookVector * step)
-			elseif code == Enum.KeyCode.PageDown then
+			elseif code == Enum.KeyCode.K then
 				moveBy(-camCF.LookVector * step)
 			elseif code == Enum.KeyCode.Return then
 				solve()
@@ -825,9 +827,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			elseif code == Enum.KeyCode.Quote then
 				reference = (reference % math.max(#references, 1)) + 1
 				refresh()
-			elseif code == Enum.KeyCode.Home then
+			elseif code == Enum.KeyCode.F then
+				-- Home/End are Studio's too (jump to first/last in the Explorer).
 				order(true)
-			elseif code == Enum.KeyCode.End then
+			elseif code == Enum.KeyCode.B then
 				order(false)
 			elseif code == Enum.KeyCode.BackSlash then
 				local target = current()
