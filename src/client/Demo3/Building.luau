@@ -167,8 +167,14 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 		-- sub-model and its seams have to go with it.
 		local att = Instance.new("Attachment")
 		att.Name = node.id
-		att.WorldPosition = (origin * CFrame.new(node.local_)).Position
+		local world = (origin * CFrame.new(node.local_)).Position
+		-- PARENT FIRST. WorldCFrame on an unparented Attachment is stored as the LOCAL frame, so
+		-- assigning it before parenting silently places every node at host.CFrame times the pose
+		-- that was meant to be absolute.
 		att.Parent = host
+		-- The CFrame carries the orientation as well as the point: LookVector is the outward
+		-- direction, UpVector the surface normal.
+		att.WorldCFrame = CFrame.lookAt(world, world + node.outward, Vector3.yAxis)
 		attachments[node.id] = att
 
 		-- A Neon bar across the seam mouth, laid flat on the surface. Neon is unlit, so it reads

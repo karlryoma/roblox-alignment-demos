@@ -1,33 +1,43 @@
 --!strict
 --[[
-	DEMO 4 — MONUMENT VALLEY-STRICT TRAVERSAL (the capstone)
+	DEMO 4 — LOCKED ISOMETRIC (the capstone)
 
-	Demos 1-3 all measure the ANGLE SUBTENDED AT THE EYE -- a perspective quantity -- and commit
-	on alignment. This one does neither. It is a baked screen-space connectivity graph under an
-	orthographic projection, traversed by a puppet, and it deliberately shares almost nothing
-	with the rest of the repo: no Chain, no Orbit, no Align.probe. Contorting those to fit would
-	have produced a worse version of both.
+	Demo 4 is demo 3 with the camera taken away from the player.
 
-	THE ARCHITECTURAL INSIGHT, which is the whole demo: the camera snaps to four fixed angles and
-	the sub-model to four positions, so there are only sixteen connectivity graphs. Bake them
-	all. Rendering then uses the FOV-1 near-orthographic approximation and only has to fool the
-	eye, while gameplay logic uses a mathematically EXACT orthographic projection computed in
-	Graph.project. The illusion being approximate never leaks into correctness.
+	Demo 3 gives a free orbit and makes screen-space connections live only after the camera
+	settles. Here the camera snaps between four fixed isometric angles, so it is ALWAYS settled:
+	there is nothing to wait for, and the connections are live the instant a rotation completes.
+	Same real player character, same normal Humanoid walking, same Seam traversal core.
 
-	WHY FOV 1 AND ~2,400 STUDS. Roblox has no orthographic camera and FieldOfView is clamped to
-	[1, 120], so the standard approximation is FOV 1 with a distant camera: view height
-	H = 2 * D * tan(FOV/2), which at FOV 1 gives D ~= 57.3 * H. The level plus its support columns
-	is authored to about a 39-stud on-screen height, so D lands near 2,400. The exact figure is
-	computed by fitDistance and printed at boot rather than restated in prose here. Bigger costs
-	linearly and buys nothing.
+	WHAT THE FOUR STATES BUY: because the camera has finitely many poses and the sub-model has
+	four, EVERY connectivity graph can be computed up front -- sixteen of them, baked at start().
+	That is the architectural point, and it decouples two things that look coupled: the RENDERING
+	is an approximation of an orthographic projection, while the LOGIC is exact (Seam.project has
+	no perspective divide in it at all). The illusion being imperfect can never leak into
+	correctness.
 
-	HONEST LIMITATION: on low graphics settings the engine may cull a level ~2,400 studs away
-	entirely, and a script CANNOT force quality -- settings() is plugin-security and throws in a
-	live game. The HUD says so. For a demo that gets filmed on max settings this is acceptable,
-	but it is a real caveat rather than a hidden one.
+	THE RENDERING BUDGET, DERIVED NOT COPIED. FieldOfView is clamped to [1, 120] and
+	H = 2*D*tan(FOV/2). This level projects to about 54 studs of on-screen height across the four
+	states -- not the 40 a smaller diorama would -- so the standoff works out at:
 
-	CONTROLS  arrow keys rotate the view · F turns the bridge · click a tile to walk there ·
-	          R resets · Q or EXIT leaves
+	    FOV 1 -> 3,468 studs, seam residual 1.3 px, apparent size change per crossing 0.6%
+	    FOV 2 -> 1,734 studs, 2.6 px, 1.2%
+	    FOV 3 -> 1,156 studs, 3.9 px, 1.8%
+	    FOV 4 ->   867 studs, 5.2 px, 2.4%
+
+	FOV 3 is chosen. Every one of those residuals is inside the ~10 px budget, so the deciding
+	factor is DISTANCE, not orthographic purity: Roblox's level-of-detail is distance-based, not
+	screen-size-based. The engine does not know the character occupies 89 px; it sees an avatar
+	1,156 studs away and may simplify it, and graphics quality is a client setting a script cannot
+	override -- settings() is plugin-security and throws in a live game. FOV 3 is the smallest
+	standoff that still reads as parallel.
+
+	I COULD NOT TEST THAT. Nothing in this repo has run in Studio, so how the avatar actually
+	renders at 1,156 studs is unverified. If it degrades, TUNE.fovDeg is the single number to
+	change: 4 costs 867 studs and 5.2 px, 6 costs 578 studs and 7.7 px.
+
+	CONTROLS  walk with WASD · LEFT/RIGHT rotate the view · F turns the bridge · R reset ·
+	          Q or EXIT leaves.  Q stays the exit key here, as in every other demo.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -36,43 +46,35 @@ local UserInputService = game:GetService("UserInputService")
 
 local Align = require(ReplicatedStorage.Shared.Align)
 local Damp = require(ReplicatedStorage.Shared.Damp)
+local Seam = require(ReplicatedStorage.Shared.Seam)
 local Session = require(ReplicatedStorage.Shared.Session)
 local Shell = require(ReplicatedStorage.Shared.Shell)
 
+local Feedback = require(script.Parent.Feedback)
 local Hud = require(script.Parent.Hud)
-local Graph = require(script.Graph)
 local Level = require(script.Level)
 
 local TUNE = {
-	fovDeg = 1,
-	elevationDeg = 35.264, -- true isometric: atan(1/sqrt(2)). Makes the (1,1,1) joins exact.
+	fovDeg = 3,
+	elevationDeg = 35.264, -- true isometric: the four yaw states then give the four diagonals
 	yawDeg = { 45, 135, 225, 315 },
-	frameMargin = 1.12, -- the level fills 1/1.12 of the binding axis
-	framePad = 1.5, -- a little air around the measured geometry bounds
+	frameMargin = 1.12,
+	framePad = 2.0,
 
-	--[[ Studs of screen-space separation that still counts as coincident. The bake is an EXACT
-	     orthographic projection -- the FOV-1 perspective residual never enters it -- so this only
-	     has to absorb floating-point error, not viewing error. At 0.9 it was admitting four
-	     coincidences the level never authored, ~0.82 studs apart (about 27 px on screen), which
-	     is a visible gap the player would be asked to believe in. ]]
-	epsilon = 0.08,
-	visibilityRayLength = 400,
-	visibilityBackoff = 0.6, -- stop the ray short so a node's own tile is not "in front of" it
-
-	cameraTurnTime = 0.65, -- the rotation IS the mechanic: slow enough to read
-	rotorTurnTime = 0.5,
-	walkSpeed = 9, -- studs per second along a real edge
-	snapPause = 0.12, -- a beat either side of a virtual-edge snap, so the jump reads
-	clickRadiusPx = 70,
-
-	characterOffset = Vector3.new(300, 0, 0), -- far outside a ~30-stud frame
+	epsilon = 0.9,
+	--[[ The rotation IS the mechanic. Fast enough not to drag, slow enough that the player
+	     watches the join arrive. ]]
+	turnTime = 0.65,
+	rotorTime = 0.6,
+	walkSpeed = 16,
+	fallY = -40,
 }
 
 local Demo4 = {}
 
-Demo4.id = "monument"
-Demo4.title = "DEMO 4 — MONUMENT VALLEY TRAVERSAL"
-Demo4.blurb = "Baked screen-space connectivity. Rotate the world; impossible joins become real."
+Demo4.id = "isometric"
+Demo4.title = "DEMO 4 — LOCKED ISOMETRIC"
+Demo4.blurb = "Four fixed angles, a turning bridge, sixteen baked graphs. Always settled."
 Demo4.ready = true
 Demo4.region = CFrame.new(0, 12000, 0)
 
@@ -99,54 +101,27 @@ function Demo4.start(ctx: Shell.Context): boolean
 		hud.fade(0, 0)
 		hud.setProgress(0, false, false)
 
-		-- Flat-shaded by intent: at this distance shadows are dead anyway, so the look leans on
-		-- raised ambient and hand-picked face colours.
+		-- Flat-shaded on purpose: shadows are dead at this range, so the look leans on raised
+		-- ambient and hand-picked face colours.
 		s.add(ctx.dim({ depthOfField = true, atmosphere = true, fog = true }))
 
 		local level = Level.build(origin, workspace)
 		s.add(level.destroy)
-
-		--[[
-			The avatar is not the traversal: freeze it and park it far outside the frame.
-
-			LEASED, not fire-and-forget. A respawn hands back a fresh, unfrozen character, so the
-			hook below has to take a NEW hold -- and dropping that undo would leave the player
-			anchored with WalkSpeed 0 back in the menu with no way out, because the shell has
-			disabled the reset button globally.
-		]]
-		local unfreeze: (() -> ())? = nil
-		local function holdAvatar()
-			if unfreeze then
-				unfreeze()
-				unfreeze = nil
-			end
-			unfreeze = Shell.holdCharacter(ctx.player)
-		end
-		holdAvatar()
-		s.add(function()
-			if unfreeze then
-				unfreeze()
-				unfreeze = nil
-			end
-		end)
-		ctx.place(origin * CFrame.new(TUNE.characterOffset))
+		ctx.place(level.spawnCF)
 
 		--------------------------------------------------------------------------------
-		-- camera states
+		-- camera: four fixed poses, written every frame
 		--------------------------------------------------------------------------------
-		local targetWorld = (origin * CFrame.new(level.centre)).Position
+		local focusWorld = (origin * CFrame.new(level.centre)).Position
 
-		local function directionFor(stateIndex: number): Vector3
-			return Align.fromSpherical(math.rad(TUNE.yawDeg[stateIndex]), math.rad(TUNE.elevationDeg), 1)
+		local function directionFor(yawRad: number): Vector3
+			return Align.fromSpherical(yawRad, math.rad(TUNE.elevationDeg), 1)
 		end
 
-		--[[ Fit the whole diorama in every state, against whichever viewport axis binds. ]]
 		local function fitDistance(): number
 			local halfV = math.tan(math.rad(TUNE.fovDeg) * 0.5)
 			local vp = cam.ViewportSize
 			local aspect = if vp.Y > 0 then vp.X / vp.Y else 1
-			-- The eight corners of the ACTUAL geometry, not the node points: the columns hang below
-			-- the tiles they carry, and fitting to nodes alone slices them off the bottom.
 			local lo, hi = level.boundsMin, level.boundsMax
 			local corners: { Vector3 } = {}
 			for _, x in { lo.X, hi.X } do
@@ -156,22 +131,20 @@ function Demo4.start(ctx: Shell.Context): boolean
 					end
 				end
 			end
-
 			local widest, tallest = 0, 0
-			for stateIndex = 1, 4 do
-				local probe = CFrame.lookAt(targetWorld + directionFor(stateIndex) * 100, targetWorld)
+			for i = 1, 4 do
+				local dir = directionFor(math.rad(TUNE.yawDeg[i]))
+				local probe = CFrame.lookAt(focusWorld + dir * 100, focusWorld)
 				local minX, maxX, minY, maxY = math.huge, -math.huge, math.huge, -math.huge
 				for _, corner in corners do
-					local screen = (Graph.project(corner, probe))
+					local screen = (Seam.project(corner, probe))
 					minX, maxX = math.min(minX, screen.X), math.max(maxX, screen.X)
 					minY, maxY = math.min(minY, screen.Y), math.max(maxY, screen.Y)
 				end
 				widest = math.max(widest, (maxX - minX) + 2 * TUNE.framePad)
 				tallest = math.max(tallest, (maxY - minY) + 2 * TUNE.framePad)
 			end
-			local needV = tallest * 0.5 / halfV
-			local needH = widest * 0.5 / (halfV * aspect)
-			return TUNE.frameMargin * math.max(needV, needH)
+			return TUNE.frameMargin * math.max(tallest * 0.5 / halfV, widest * 0.5 / (halfV * aspect))
 		end
 
 		local snapshot = {
@@ -187,8 +160,8 @@ function Demo4.start(ctx: Shell.Context): boolean
 				return
 			end
 			restored = true
-			-- CameraType LAST: restoring it first hands control back to the default scripts,
-			-- which then fight every property written after it.
+			-- CameraType LAST: restoring it first hands control back to the default scripts, which
+			-- then fight every property written after it.
 			cam.FieldOfViewMode = snapshot.fovMode
 			cam.FieldOfView = snapshot.fov
 			cam.CFrame = snapshot.cframe
@@ -202,177 +175,151 @@ function Demo4.start(ctx: Shell.Context): boolean
 		cam.FieldOfView = TUNE.fovDeg
 		local distance = fitDistance()
 
-		local function cframeForYaw(yawRad: number): CFrame
-			local dir = Align.fromSpherical(yawRad, math.rad(TUNE.elevationDeg), 1)
-			return CFrame.lookAt(targetWorld + dir * distance, targetWorld)
-		end
-
-		local function cframeFor(stateIndex: number): CFrame
-			return cframeForYaw(math.rad(TUNE.yawDeg[stateIndex]))
-		end
-
-		-- Only the distance needs recomputing here: the pose is rewritten every frame from it.
 		local viewportConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
 			distance = fitDistance()
 		end)
 		s.track(viewportConn)
 
-		--------------------------------------------------------------------------------
-		-- the bake
-		--------------------------------------------------------------------------------
-		local visibilityParams = RaycastParams.new()
-		--[[
-			ONLY BULK GEOMETRY OCCLUDES. The tiles and the rotor carry the nodes themselves, and
-			any coincident pair necessarily has one tile in front of the other -- testing against
-			them would reject every join by construction, including the ones the level is built
-			around. So the test asks the question that actually matters in Monument Valley: is
-			this join hidden behind the ARCHITECTURE? The monolith proves it is not a no-op.
-		]]
-		visibilityParams.FilterType = Enum.RaycastFilterType.Include
-		visibilityParams.FilterDescendantsInstances = { level.occluders }
-		visibilityParams.RespectCanCollide = false
-		visibilityParams.IgnoreWater = true
-
-		local function worldPositions(turns: number): { Vector3 }
-			local out: { Vector3 } = {}
-			for _, p in Level.positions(turns) do
-				table.insert(out, (origin * CFrame.new(p)).Position)
-			end
-			return out
+		local function cframeForYaw(yawRad: number): CFrame
+			return CFrame.lookAt(focusWorld + directionFor(yawRad) * distance, focusWorld)
 		end
 
-		local function visibilityFor(dir: Vector3, positions: { Vector3 }): (index: number) -> boolean
-			return function(index: number): boolean
-				local target = positions[index]
-				local from = target + dir * TUNE.visibilityRayLength
-				local span = TUNE.visibilityRayLength - TUNE.visibilityBackoff
-				return workspace:Raycast(from, -dir * span, visibilityParams) == nil
-			end
+		--------------------------------------------------------------------------------
+		-- seams
+		--------------------------------------------------------------------------------
+		local nodes: { Seam.Node } = {}
+		local indexById: { [string]: number } = {}
+		for _, spec in Level.NODES do
+			table.insert(nodes, { id = spec.id, point = level.attachments[spec.id], surface = spec.surface })
+			indexById[spec.id] = #nodes
 		end
 
-		local graphs: { [number]: Graph.Baked } = {}
-		local function graphKey(camState: number, rotorState: number): number
+		local seamOptions = Seam.defaults()
+		seamOptions.epsilon = TUNE.epsilon
+		seamOptions.occluders = { level.occluders }
+
+		local traverser = Seam.newTraverser(nodes, Seam.traverserDefaults())
+
+		--------------------------------------------------------------------------------
+		-- the bake: sixteen graphs, computed up front
+		--------------------------------------------------------------------------------
+		local graphs: { [number]: Seam.Graph } = {}
+		local function key(camState: number, rotorState: number): number
 			return camState * 4 + rotorState
 		end
 
 		local function bakeAll()
 			for rotorState = 0, 3 do
-				-- The rotor is NOT moved for the bake. Node positions come from Level.positions,
-				-- not from the instance, and the rotor carries nodes so it is not in the occluder
-				-- filter -- moving it would change nothing the raycasts can see.
-				local positions = worldPositions(rotorState)
-				local realEdges = Level.realEdges(rotorState)
+				-- The rotor must PHYSICALLY be in each state: Seam reads live Attachment
+				-- WorldCFrames, which is exactly what makes a rotated seam correct.
+				level.setRotor(rotorState)
 				for camState = 0, 3 do
-					local dir = directionFor(camState + 1)
-					graphs[graphKey(camState, rotorState)] =
-						Graph.bake(positions, realEdges, cframeFor(camState + 1), TUNE.epsilon, visibilityFor(dir, positions))
+					graphs[key(camState, rotorState)] =
+						Seam.build(nodes, cframeForYaw(math.rad(TUNE.yawDeg[camState + 1])), seamOptions)
 				end
+			end
+		end
+
+		--------------------------------------------------------------------------------
+		-- character
+		--------------------------------------------------------------------------------
+		local releaseCharacter: (() -> ())? = nil
+		local function prepareCharacter()
+			if releaseCharacter then
+				releaseCharacter()
+				releaseCharacter = nil
+			end
+			local character = ctx.player.Character
+			local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+			if not humanoid then
+				return
+			end
+			local walk, power, height = humanoid.WalkSpeed, humanoid.JumpPower, humanoid.JumpHeight
+			humanoid.JumpPower = 0
+			humanoid.JumpHeight = 0
+			humanoid.WalkSpeed = TUNE.walkSpeed
+			releaseCharacter = function()
+				if humanoid.Parent then
+					humanoid.WalkSpeed = walk
+					humanoid.JumpPower = power
+					humanoid.JumpHeight = height
+				end
+			end
+		end
+		prepareCharacter()
+		s.add(function()
+			if releaseCharacter then
+				releaseCharacter()
+				releaseCharacter = nil
+			end
+		end)
+
+		local function setWalkable(on: boolean)
+			local character = ctx.player.Character
+			local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+			if humanoid then
+				humanoid.WalkSpeed = if on then TUNE.walkSpeed else 0
 			end
 		end
 
 		--------------------------------------------------------------------------------
 		-- state
 		--------------------------------------------------------------------------------
-		local camState = 1 -- 0-based index into yawDeg; starts on the state that opens the first join
-		--[[ Starts UNDOCKED. With the bridge already spanning the gap, turning it could only ever
-		     destroy the route, so the sub-model would be a way to lose rather than a move to make.
-		     Starting across the gap means pressing F is a step of the solution. ]]
-		local rotorState = 1
-		local nodeIndex = Level.START_INDEX
-		local path: { number } = {}
-		local pathAt = 0
-		local walkT = 0
-		local pauseFor = 0
-		local busy = false -- a tween is running, or the puppet is mid-edge
-		local turning = 0 -- seconds remaining in a rotation
-		local turnFrom, turnTo = 0, 0
-		local yawNow = 0 -- the pose actually written this frame
-		local rotorFrom, rotorTo = 0, 0
+		local camState = 1 -- the route needs 0 first, so the player must rotate to reach it
+		local rotorState = 0
+		local turning = 0
 		local turningRotor = false
+		local fromYaw, toYaw = 0, 0
+		local rotorFrom, rotorTo = 0, 0
+		local rotorPrevCF = level.rotor:GetPivot()
+		local riding = false
+		local yawNow = math.rad(TUNE.yawDeg[camState + 1])
+		local lastSafe = level.spawnCF
+		local solved = false
+		local resetQueued = false
+		local prox = 0
 
-		level.setRotor(rotorState)
+		local liveBars: { [BasePart]: boolean } = {}
+		local flashFor = 0
 
-		local function activeGraph(): Graph.Baked
-			return graphs[graphKey(camState, rotorState)]
-		end
-
-		--------------------------------------------------------------------------------
-		-- the puppet: an anchored model, CFramed along edges. No Humanoid, no physics.
-		--------------------------------------------------------------------------------
-		local puppet = Instance.new("Model")
-		puppet.Name = "Puppet"
-		local body = Instance.new("Part")
-		body.Name = "Body"
-		body.Size = Vector3.new(1.1, 1.8, 1.1)
-		body.Color = Color3.fromRGB(250, 250, 252)
-		body.Material = Enum.Material.SmoothPlastic
-		body.Anchored = true
-		body.CanCollide = false
-		body.CanTouch = false
-		body.CanQuery = false
-		body.CastShadow = false
-		body.Parent = puppet
-		puppet.PrimaryPart = body
-		local hat = Instance.new("Part")
-		hat.Name = "Hat"
-		hat.Shape = Enum.PartType.Ball
-		hat.Size = Vector3.new(1.0, 1.0, 1.0)
-		hat.Color = Color3.fromRGB(226, 92, 106)
-		hat.Material = Enum.Material.SmoothPlastic
-		hat.Anchored = true
-		hat.CanCollide = false
-		hat.CanTouch = false
-		hat.CanQuery = false
-		hat.CastShadow = false
-		hat.Parent = puppet
-		puppet.Parent = level.folder
-
-		local function nodeWorld(index: number, turns: number): Vector3
-			return (origin * CFrame.new(Level.positions(turns)[index])).Position
-		end
-
-		local function placePuppet(at: Vector3)
-			body.CFrame = CFrame.new(at + Vector3.new(0, 0.9, 0))
-			hat.CFrame = CFrame.new(at + Vector3.new(0, 2.2, 0))
-		end
-		placePuppet(nodeWorld(nodeIndex, rotorState))
-
-		--------------------------------------------------------------------------------
-		-- boot report
-		--------------------------------------------------------------------------------
-		bakeAll()
-		level.setRotor(rotorState)
-
-		do
-			local nodeCount = #Level.NODES + 3
-			print(`[demo4] baked {nodeCount} nodes, camera distance {math.floor(distance)} studs at FOV {TUNE.fovDeg}`)
-			local solvedSolo: { string } = {}
-			for c = 0, 3 do
-				local line = {}
-				for r = 0, 3 do
-					local g = graphs[graphKey(c, r)]
-					local reach = Graph.reachable(g.adj, Level.START_INDEX)
-					if reach[Level.GOAL_INDEX] then
-						table.insert(solvedSolo, `cam{c}/rotor{r}`)
-					end
-					local reachCount = 0
-					for _ in reach do
-						reachCount += 1
-					end
-					table.insert(line, `r{r}: {g.realCount}real {g.virtualCount}virt {reachCount}reach`)
+		local fx = Feedback.new()
+		s.add(fx.destroy)
+		fx.add(function(p: number, dt: number)
+			flashFor = math.max(flashFor - dt, 0)
+			local flash = flashFor / 0.3
+			for _, bar in level.bars do
+				if liveBars[bar] then
+					local lit = Level.COLD:Lerp(Level.HOT, p)
+					bar.Color = if flash > 0 then lit:Lerp(Color3.new(1, 1, 1), flash) else lit
+				else
+					bar.Color = Level.COLD
 				end
-				print(`[demo4] cam{c} ({TUNE.yawDeg[c + 1]} deg) · {table.concat(line, " | ")}`)
 			end
-			local hidden = 0
-			for _, g in graphs do
-				hidden += g.hiddenCount
+		end)
+
+		local function installGraph()
+			local graph = graphs[key(camState, rotorState)]
+			traverser.setGraph(graph, ctx.player.Character)
+			table.clear(liveBars)
+			for _, edge in graph.edges do
+				local barA = level.markers[nodes[edge.a].id]
+				local barB = level.markers[nodes[edge.b].id]
+				if barA then
+					liveBars[barA] = true
+				end
+				if barB then
+					liveBars[barB] = true
+				end
 			end
-			print(`[demo4] coincidences rejected as hidden behind architecture: {hidden}`)
-			if #solvedSolo > 0 then
-				warn(`[demo4] the goal is reachable without rotating: {table.concat(solvedSolo, ", ")} — rotation is decorative`)
-			else
-				print("[demo4] no single state reaches the goal: rotation is required")
-			end
+			flashFor = 0.3
+			-- Always restored to something true: guarding this on `not solved` left the line reading
+			-- "rotating" forever after the first post-solve rotation.
+			hud.setState(
+				if solved
+					then "SOLVED — one angle, one turn, one route"
+					elseif #graph.edges > 0 then `{#graph.edges} seam(s) live`
+					else "nothing coincides from here"
+			)
 		end
 
 		--------------------------------------------------------------------------------
@@ -389,118 +336,71 @@ function Demo4.start(ctx: Shell.Context): boolean
 		end
 		hud.exitButton.Activated:Connect(doExit)
 
-		local function setHint()
-			hud.setHint("← → rotate view · F turns the bridge · click a tile · R reset · Q leave · wants high graphics")
-		end
-		setHint()
-
-		local function refuse(message: string)
-			hud.setState(message)
-		end
-
-		local function startTurn(delta: number)
-			if busy then
-				refuse("hold — finish moving first")
+		local function beginTurn(delta: number)
+			if turning > 0 then
 				return
 			end
-			turnFrom = math.rad(TUNE.yawDeg[camState + 1])
+			fromYaw = math.rad(TUNE.yawDeg[camState + 1])
 			camState = (camState + delta) % 4
-			turnTo = turnFrom + math.rad(90 * delta)
-			turning = TUNE.cameraTurnTime
+			toYaw = fromYaw + math.rad(90 * delta)
+			turning = TUNE.turnTime
 			turningRotor = false
-			busy = true
+			-- Connectivity is undefined mid-rotation, and the camera-relative movement basis is
+			-- swinging under the player's fingers. Freeze both; Monument Valley pauses too.
+			traverser.setGraph(nil, nil)
+			table.clear(liveBars)
+			setWalkable(false)
 			hud.setState("rotating")
 		end
 
-		local function startRotor()
-			if busy then
-				refuse("hold — finish moving first")
+		local function beginRotor()
+			if turning > 0 then
 				return
 			end
 			rotorFrom = rotorState
 			rotorState = (rotorState + 1) % 4
 			rotorTo = rotorFrom + 1
-			turning = TUNE.rotorTurnTime
+			turning = TUNE.rotorTime
 			turningRotor = true
-			busy = true
+			rotorPrevCF = level.rotor:GetPivot()
+
+			-- Is the player standing ON the bridge? If so they ride it, which is the Monument
+			-- Valley behaviour and much better than refusing the rotation.
+			riding = false
+			local character = ctx.player.Character
+			local root = if character then character:FindFirstChild("HumanoidRootPart") else nil
+			if root and root:IsA("BasePart") then
+				-- Tested against the deck's own frame rather than by raycast: a query depends on
+				-- CanQuery being set on every part it might hit, and this is the demo's headline
+				-- mechanic -- it should not be one flag away from silently never running.
+				local deck = level.rotorDeck
+				local p = deck.CFrame:PointToObjectSpace(root.Position)
+				local half = deck.Size * 0.5
+				riding = math.abs(p.X) <= half.X + 1
+					and math.abs(p.Z) <= half.Z + 1
+					and p.Y > 0
+					and p.Y < 8
+			end
+
+			traverser.setGraph(nil, nil)
+			table.clear(liveBars)
+			setWalkable(false)
 			hud.setState("turning the bridge")
 		end
 
 		local function resetDemo()
-			path = {}
-			pathAt = 0
-			busy = false
 			turning = 0
-			nodeIndex = Level.START_INDEX
 			camState = 1
-			rotorState = 1
+			rotorState = 0
+			solved = false
 			level.setRotor(rotorState)
-			placePuppet(nodeWorld(nodeIndex, rotorState))
-			hud.setState("")
-			setHint()
-		end
-
-		--[[
-			Click-to-move. Nodes are projected with the ACTUAL camera's WorldToViewportPoint --
-			more robust at FOV 1 than unprojecting a screen ray, where a one-pixel error becomes
-			metres at 1,700 studs.
-		]]
-		local function clickAt(screen: Vector2)
-			if busy then
-				refuse("hold — the view is turning")
-				return
-			end
-			--[[
-				Coincident tiles are the POINT of this demo, so the click cannot be resolved by
-				nearest-pixel alone: at a join the two nodes are separated by a couple of pixels of
-				perspective residual, far below aiming precision, and whichever won would be
-				decided by sub-pixel noise rather than by the player. So: gather every candidate
-				within the radius, drop the node the puppet is already on, and pick the one with
-				the SHORTEST route -- which at a join is the far side, the thing the player meant.
-			]]
-			local positions = worldPositions(rotorState)
-			local candidates: { number } = {}
-			for i, world in positions do
-				local point, onScreen = cam:WorldToViewportPoint(world)
-				if onScreen and (Vector2.new(point.X, point.Y) - screen).Magnitude <= TUNE.clickRadiusPx then
-					table.insert(candidates, i)
-				end
-			end
-			if #candidates == 0 then
-				return
-			end
-
-			local adj = activeGraph().adj
-			local best: number? = nil
-			local bestLength = math.huge
-			local sawSelf = false
-			for _, i in candidates do
-				if i == nodeIndex then
-					sawSelf = true
-				else
-					local route = Graph.path(adj, nodeIndex, i)
-					if route and #route < bestLength then
-						best, bestLength = i, #route
-					end
-				end
-			end
-
-			if not best then
-				-- Never silent: a dead click at the moment the join fuses is exactly when the demo
-				-- looks broken.
-				refuse(if sawSelf then "already there — click the far side of the join" else "no route from here in this view")
-				return
-			end
-			local route = Graph.path(adj, nodeIndex, best)
-			if not route then
-				refuse("no route from here in this view")
-				return
-			end
-			path = route
-			pathAt = 1
-			walkT = 0
-			busy = true
-			hud.setState("")
+			rotorPrevCF = level.rotor:GetPivot()
+			yawNow = math.rad(TUNE.yawDeg[camState + 1])
+			ctx.place(level.spawnCF)
+			lastSafe = level.spawnCF
+			setWalkable(true)
+			installGraph()
+			hud.setHint("← → turn the view · F turns the bridge · R reset · Q or EXIT to leave · wants high graphics")
 		end
 
 		local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
@@ -508,131 +408,176 @@ function Demo4.start(ctx: Shell.Context): boolean
 				return
 			end
 			if input.KeyCode == Enum.KeyCode.Left then
-				startTurn(-1)
+				beginTurn(-1)
 			elseif input.KeyCode == Enum.KeyCode.Right then
-				startTurn(1)
+				beginTurn(1)
 			elseif input.KeyCode == Enum.KeyCode.F then
-				startRotor()
+				beginRotor()
 			elseif input.KeyCode == Enum.KeyCode.R then
-				resetDemo()
+				resetQueued = true
 			elseif input.KeyCode == Enum.KeyCode.Q then
 				doExit()
-			elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-				clickAt(UserInputService:GetMouseLocation())
-			elseif input.UserInputType == Enum.UserInputType.Touch then
-				clickAt(Vector2.new(input.Position.X, input.Position.Y))
 			end
 		end)
 		s.track(inputConn)
 
 		ctx.onCharacter(function()
-			-- Re-hide and re-park: a respawn returns an unfrozen character at the lobby, and hands
-			-- CameraType back to the default scripts.
-			holdAvatar()
-			Shell.placeCharacter(ctx.player, origin * CFrame.new(TUNE.characterOffset))
+			prepareCharacter()
+			Shell.placeCharacter(ctx.player, lastSafe)
 			cam.CameraType = Enum.CameraType.Scriptable
+			-- prepareCharacter hands a fresh Humanoid its walking speed back, which would lift the
+			-- rotation freeze for the rest of the tween -- with no graph installed and the movement
+			-- basis still swinging. The freeze is the authority here.
+			setWalkable(turning <= 0)
+			riding = false
 		end)
+
+		--------------------------------------------------------------------------------
+		-- bake and report
+		--------------------------------------------------------------------------------
+		bakeAll()
+		level.setRotor(rotorState)
+
+		do
+			print(
+				("[demo4] FOV %d, fitted standoff %.0f studs -> %.1f px per stud at 1080p"):format(
+					TUNE.fovDeg,
+					distance,
+					(1080 / 2) / (distance * math.tan(math.rad(TUNE.fovDeg) * 0.5))
+				)
+			)
+			local soloSolve: string? = nil
+			for c = 0, 3 do
+				local row = {}
+				for r = 0, 3 do
+					local graph = graphs[key(c, r)]
+					local reach = Seam.reachableSurfaces(nodes, Level.REAL_EDGES, graph, Level.START_SURFACE)
+					local names = {}
+					for _, edge in graph.edges do
+						table.insert(names, `{nodes[edge.a].id}~{nodes[edge.b].id}`)
+					end
+					if reach[Level.GOAL_SURFACE] then
+						soloSolve = `cam{c}/rotor{r}`
+					end
+					local flags = ""
+					if graph.rejectedOrientation > 0 then
+						flags ..= `!orient x{graph.rejectedOrientation}`
+					end
+					if graph.rejectedHidden > 0 then
+						flags ..= `!hidden x{graph.rejectedHidden}`
+					end
+					table.insert(row, `r{r}:{if #names > 0 then table.concat(names, "+") else "-"}{flags}`)
+				end
+				print(`[demo4] cam{c} ({TUNE.yawDeg[c + 1]} deg) {table.concat(row, " | ")}`)
+			end
+			if soloSolve then
+				warn(`[demo4] {soloSolve} reaches the goal on its own -- rotation is decorative`)
+			else
+				print("[demo4] no single state reaches the goal: both rotations are required")
+			end
+		end
+
+		installGraph()
+		hud.setHint("← → turn the view · F turns the bridge · R reset · Q or EXIT to leave · wants high graphics")
 
 		--------------------------------------------------------------------------------
 		-- THE FRAME LOOP
 		--------------------------------------------------------------------------------
-		cam.CFrame = cframeFor(camState + 1)
-		cam.Focus = CFrame.new(targetWorld)
-
 		local bind = ctx.bindName
 		RunService:BindToRenderStep(bind, Enum.RenderPriority.Camera.Value + 1, function(rawDt: number)
 			local dt = Damp.clampDt(rawDt)
 
-			-- 1. rotation. Connectivity is UNDEFINED mid-rotation, so input is locked and the
-			--    puppet is frozen until the tween lands; only then does the graph swap.
-			yawNow = math.rad(TUNE.yawDeg[camState + 1])
+			if resetQueued then
+				resetQueued = false
+				resetDemo()
+			end
 
 			if turning > 0 then
 				turning = math.max(turning - dt, 0)
-				local total = if turningRotor then TUNE.rotorTurnTime else TUNE.cameraTurnTime
+				local total = if turningRotor then TUNE.rotorTime else TUNE.turnTime
 				local alpha = Damp.easeOutQuint(1 - turning / total)
 				if turningRotor then
 					level.setRotor(rotorFrom + (rotorTo - rotorFrom) * alpha)
-					-- If the puppet is standing on the rotor, it rides it.
-					if nodeIndex > #Level.NODES then
-						placePuppet(nodeWorld(nodeIndex, rotorFrom + (rotorTo - rotorFrom) * alpha))
+					local nowCF = level.rotor:GetPivot()
+					if riding then
+						local character = ctx.player.Character
+						if character then
+							-- Carried by the same rigid delta the deck moved through, so the player
+							-- turns with the bridge instead of being left behind by it.
+							character:PivotTo(nowCF * rotorPrevCF:Inverse() * character:GetPivot())
+						end
 					end
+					rotorPrevCF = nowCF
 				else
-					-- Interpolate the YAW, not the CFrame: lerping position would cut a chord
-					-- through the sphere and visibly change the apparent size mid-turn.
-					yawNow = turnFrom + (turnTo - turnFrom) * alpha
+					yawNow = fromYaw + (toYaw - fromYaw) * alpha
 				end
 				if turning <= 0 then
-					busy = #path > 0
 					if turningRotor then
 						level.setRotor(rotorState)
-						if nodeIndex > #Level.NODES then
-							placePuppet(nodeWorld(nodeIndex, rotorState))
-						end
+						rotorPrevCF = level.rotor:GetPivot()
+						riding = false
 					else
 						yawNow = math.rad(TUNE.yawDeg[camState + 1])
 					end
-					hud.setState("")
+					setWalkable(true)
+					installGraph()
 				end
 			end
 
-			--[[
-				THE CAMERA IS WRITTEN EVERY FRAME, unconditionally, before anything can return
-				early. Writing it only on transitions meant a respawn -- which hands CameraType
-				back to the default scripts -- left the view parked on the avatar 300 studs away
-				for the rest of the session, with no path back. Focus goes with it: left alone it
-				stays at the lobby, thousands of studs behind the camera.
-			]]
+			-- Written every frame, before anything can return early: a respawn hands CameraType
+			-- back to the default scripts, and a camera written only on transitions never recovers.
 			cam.CFrame = cframeForYaw(yawNow)
-			cam.Focus = CFrame.new(targetWorld)
+			cam.Focus = CFrame.new(focusWorld)
 
-			if turning > 0 then
-				return -- connectivity is undefined mid-rotation: the puppet is frozen
-			end
-
-			-- 2. traversal
-			if pauseFor > 0 then
-				pauseFor = math.max(pauseFor - dt, 0)
-				return
-			end
-
-			if #path > 0 and pathAt < #path then
-				local fromIndex = path[pathAt]
-				local toIndex = path[pathAt + 1]
-				local a = nodeWorld(fromIndex, rotorState)
-				local b = nodeWorld(toIndex, rotorState)
-
-				if Graph.isVirtual(activeGraph(), fromIndex, toIndex) then
-					-- A SNAP, not a slide. Roblox gives no per-object depth sorting, so a puppet
-					-- straddling two depths cannot be rendered correctly; Monument Valley
-					-- teleports across the seam for the same reason.
-					placePuppet(b)
-					nodeIndex = toIndex
-					pathAt += 1
-					pauseFor = TUNE.snapPause
-					hud.setState("crossed a join")
-				else
-					local span = (b - a).Magnitude
-					walkT += dt * TUNE.walkSpeed / math.max(span, 0.001)
-					if walkT >= 1 then
-						placePuppet(b)
-						nodeIndex = toIndex
-						pathAt += 1
-						walkT = 0
-					else
-						placePuppet(a:Lerp(b, walkT))
-					end
+			local character = ctx.player.Character
+			if character and turning <= 0 then
+				local crossed = traverser.step(dt, character)
+				if crossed and not solved then
+					hud.setState(("CROSSED — %.0f studs of depth, invisibly"):format(crossed.depthDelta))
 				end
 
-				if pathAt >= #path then
-					path = {}
-					pathAt = 0
-					busy = false
-					if nodeIndex == Level.GOAL_INDEX then
-						hud.setState("GOAL — the join was only there from one angle")
+				local root = character:FindFirstChild("HumanoidRootPart")
+				local humanoid = character:FindFirstChildOfClass("Humanoid")
+				if root and root:IsA("BasePart") then
+					local localPos = origin:PointToObjectSpace(root.Position)
+
+					if not solved and math.abs(localPos.X - 10) < 2.5 and math.abs(localPos.Z + 24) < 2.5 then
+						solved = true
+						flashFor = 0.3
+						hud.setState("SOLVED — one angle, one turn, one route")
+					end
+
+					if localPos.Y < TUNE.fallY then
+						Shell.placeCharacter(ctx.player, lastSafe)
+					elseif not crossed and humanoid and humanoid.FloorMaterial ~= Enum.Material.Air then
+						--[[
+							Never latch a pose that the ROTOR carries. A world CFrame recorded on the
+							deck stops describing a floor the moment the bridge turns, and the fall
+							catch would then teleport the player back into the same patch of empty
+							air every time.
+						]]
+						local deck = level.rotorDeck
+						local onDeck = deck.CFrame:PointToObjectSpace(root.Position)
+						local half = deck.Size * 0.5
+						local carried = math.abs(onDeck.X) <= half.X + 1
+							and math.abs(onDeck.Z) <= half.Z + 1
+							and onDeck.Y > 0
+							and onDeck.Y < 8
+						local inside = math.abs(localPos.X) < 40 and math.abs(localPos.Z) < 40 and localPos.Y > -20
+						if inside and not carried then
+							lastSafe = character:GetPivot()
+						end
 					end
 				end
 			end
+
+			-- The meter tracks what is actually live, so the bars are not pinned at full glow in
+			-- states where nothing coincides.
+			local anyLive = next(liveBars) ~= nil
+			local target = if turning > 0 then 0 elseif anyLive then 1 else 0.25
+			prox = Damp.damp(prox, target, dt, 0.12)
+			hud.setProgress(prox, anyLive, solved)
+			fx.render(prox, dt)
 		end)
 		s.add(function()
 			RunService:UnbindFromRenderStep(bind)

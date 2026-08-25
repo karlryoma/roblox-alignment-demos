@@ -9,7 +9,7 @@ not a shipped game: client-only, no server authority, placeholder art on purpose
 | 1 | **Item inspection** — a puzzle box turned in the hand, near-orthographic | built |
 | 2 | **Room-scale align-to-unlock** — walk a room, two-step chain | built |
 | 3 | **Dwell to weave** — hold the camera still and coincident surfaces connect | built |
-| 4 | **Monument Valley traversal** — baked screen-space connectivity, rotate the world | built |
+| 4 | **Locked isometric** — four fixed angles, a turning bridge, sixteen baked graphs | built |
 
 ## Running it
 
@@ -145,50 +145,45 @@ no per-character override, so Monument Valley's walls-become-floors moments are 
 Humanoid is abandoned — which is the one thing this design exists to keep. Most MV traversal is
 flat walkway anyway, so the illusion still reads.
 
-## Demo 4 — Monument Valley traversal
+## Demo 4 — Locked isometric
 
 <!-- GIF: demo4.gif -->
 
-← → rotate the view · `F` turns the bridge · click a tile to walk there · `R` reset · `Q` leave.
+Walk with WASD · ← → rotate the view · `F` turns the bridge · `R` reset · `Q` leave.
 **Wants high graphics settings** — see the caveat below.
 
-The capstone, and deliberately the odd one out. Demos 1–3 all measure the angle subtended at
-the eye — a perspective quantity — and commit on alignment. This one does neither. It is a
-**baked screen-space connectivity graph under an orthographic projection**, traversed by a
-puppet. It uses `Session`, `Shell`, `Hud` and `Damp`; it does not use `Chain`, `Orbit`,
-`Mount`, `Spin` or `Align.probe`, because angular-at-eye is the wrong measure and contorting
-those modules to fit would have produced a worse version of both.
+The capstone: **demo 3 with the camera taken away from the player.** Demo 3 gives a free orbit
+and makes screen-space connections live only once the camera settles. Here the camera snaps
+between four fixed isometric angles, so it is *always* settled — nothing to wait for, and the
+seams are live the instant a rotation lands. Same character, same walking, same `Seam` core.
 
-**The architectural insight is the whole demo.** The camera snaps to four fixed angles and the
-sub-model to four positions, so there are only sixteen connectivity graphs — bake them all.
-That decouples two things that look coupled:
+**The bake is the architectural point.** Four camera states × four sub-model positions = sixteen
+connectivity graphs, all computed at `start()`. That decouples two things that look coupled: the
+**rendering** approximates an orthographic projection and only has to fool the eye, while the
+**logic** is exact — `Seam.project` drops the depth component in camera space with no
+perspective divide at all. So the illusion being imperfect can never leak into correctness. The
+bake summary prints at boot: the per-state seams, and an assertion that no single state reaches
+the goal.
 
-- **Rendering** uses the FOV-1 approximation and only has to fool the eye.
-- **Gameplay logic** uses a mathematically exact orthographic projection computed in
-  `Graph.project` — drop the depth component in camera space.
+**The route needs both rotations.** `S_end → R_a` is live only at yaw 45° with the bridge at
+rest; `R_b → T_start` only at yaw 135° with the bridge turned once. The bridge's seams are
+Attachments *on the rotating part*, so their outward directions turn with it — which is why
+`Seam` derives orientation from `Attachment.WorldCFrame` rather than storing it. Stand on the
+bridge when it turns and you are carried by the same rigid delta, as in Monument Valley.
 
-So the illusion being approximate never leaks into correctness. There is no runtime
-screen-space measurement, no floating-point drift, and no per-frame cost: a click is answered
-by a table lookup and a BFS over a few dozen edges.
+**The rendering budget, derived.** `FieldOfView` is clamped to [1, 120] and
+`H = 2·D·tan(FOV/2)`. This level projects to ~54 studs of on-screen height across the four
+states, so: FOV 1 → 3,468 studs (1.3 px seam residual); FOV 2 → 1,734 (2.6 px); **FOV 3 →
+1,156 (3.9 px)**; FOV 4 → 867 (5.2 px). Every one is inside the ~10 px budget, so the deciding
+factor is *distance*, not orthographic purity — Roblox's level-of-detail is **distance**-based,
+not screen-size-based. The engine does not know the character occupies 89 px; it sees an avatar
+1,156 studs away and may simplify it, and graphics quality is a client setting a script cannot
+override (`settings()` is plugin-security and throws in a live game). FOV 3 is the smallest
+standoff that still reads as parallel.
 
-Authoring an impossible join is exact rather than fitted: under a true isometric view
-(elevation 35.264°) two nodes coincide in the 45° state precisely when their difference is
-parallel to (1,1,1). So a join *is* adding (k,k,k) to a node.
-
-Verified before the code was reviewed: all four camera states produce different virtual edges,
-**no single (camera, sub-model) combination reaches the goal** — rotation is genuinely
-required, not decorative — and the monolith rejects exactly one coincidence as hidden, so the
-visibility rule is load-bearing rather than a no-op.
-
-**Crossing a virtual edge is a snap, not a slide.** Roblox gives no per-object depth sorting,
-so a puppet straddling two depths cannot be rendered correctly. Monument Valley teleports
-across the seam for the same reason.
-
-**The honest caveat.** At FOV 1 the camera sits ~2,400 studs out, and on low graphics settings
-the engine may cull the level entirely. A script *cannot* force quality — `settings()` is
-plugin-security and throws in a live game. The HUD says so. For a demo that gets filmed on max
-settings this is acceptable, but it is a real limitation rather than a hidden one. Worst-case
-perspective residual at a virtual edge is 1.2 px at 1080p, and zero at frame centre.
+**That risk is untested.** Nothing in this repo has run in Studio, so how the avatar actually
+renders at 1,156 studs is unknown. `TUNE.fovDeg` is the single number to change: 4 costs 867
+studs and 5.2 px, 6 costs 578 studs and 7.7 px.
 
 ---
 

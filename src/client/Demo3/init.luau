@@ -122,8 +122,6 @@ function Demo3.start(ctx: Shell.Context): boolean
 			table.insert(nodes, {
 				id = spec.id,
 				point = attachment,
-				outward = spec.outward,
-				normal = Vector3.yAxis,
 				surface = spec.surface,
 			})
 			indexById[spec.id] = #nodes

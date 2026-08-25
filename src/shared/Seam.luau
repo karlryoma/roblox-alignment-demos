@@ -18,8 +18,8 @@
 	their surfaces share an up-vector and their outward directions are opposite. Then the crossing
 	is a PURE TRANSLATION: position, facing and velocity all carry over untouched, so the player
 	walks through a seam without the character turning, stalling, or being re-solved by physics.
-	Seam.assertOrientation checks it at authoring time and fails loudly, because a mismatched pair
-	produces a crossing that silently mangles velocity.
+	Seam.orientationFault reports a mismatched pair, and callers are expected to fail loudly on it
+	at authoring time: a mismatch produces a crossing that silently mangles velocity.
 
 	WHAT COUNTS AS AN OCCLUDER. A coincidence hidden behind the architecture must not connect --
 	Monument Valley requires the join to be visible. But a coincident pair necessarily has one
@@ -40,19 +40,32 @@
 
 local Seam = {}
 
+--[[
+	A node is an Attachment and nothing else, because the Attachment carries BOTH the position and
+	the orientation:
+
+	    outward = WorldCFrame.LookVector   the direction you walk to LEAVE this surface
+	    normal  = WorldCFrame.UpVector     the surface up
+
+	That is not a stylistic choice. A rotating sub-model turns its seams with it, and an outward
+	direction stored as a plain Vector3 would keep pointing the old way -- the crossing would then
+	translate the player along a direction the geometry no longer has. Deriving both from the
+	Attachment makes a rotated seam correct for free.
+]]
 export type Node = {
 	id: string,
-	--[[ An Attachment so the node moves with its part: a rotating sub-model carries its seams. ]]
 	point: Attachment,
-	--[[ World direction you walk to LEAVE this surface through this seam. ]]
-	outward: Vector3,
-	--[[ Surface up. Every walkable surface is a floor -- Roblox gravity is global -Y with no
-	     per-character override -- so in practice this is Vector3.yAxis. It is carried explicitly
-	     anyway, because the orientation rule is what makes the crossing free. ]]
-	normal: Vector3,
 	--[[ Which surface the node belongs to, for the reachability report. ]]
 	surface: string,
 }
+
+function Seam.outwardOf(node: Node): Vector3
+	return node.point.WorldCFrame.LookVector
+end
+
+function Seam.normalOf(node: Node): Vector3
+	return node.point.WorldCFrame.UpVector
+end
 
 export type Edge = {
 	a: number,
@@ -105,16 +118,12 @@ function Seam.orientationFault(a: Node, b: Node): string?
 	-- Normalised here rather than trusted: an un-normalised pair can pass a raw dot-product
 	-- threshold at an angle nowhere near 180 degrees, and the crossing would then be a
 	-- translation the player feels as a shove.
-	if a.normal.Magnitude < 1e-4 or b.normal.Magnitude < 1e-4 then
-		return `a normal is zero-length ({a.id} vs {b.id})`
-	end
-	if a.outward.Magnitude < 1e-4 or b.outward.Magnitude < 1e-4 then
-		return `an outward direction is zero-length ({a.id} vs {b.id})`
-	end
-	if a.normal.Unit:Dot(b.normal.Unit) < 0.999 then
+	-- Both come off a CFrame, so they are unit by construction; the checks below mean what they
+	-- say without any normalising.
+	if Seam.normalOf(a):Dot(Seam.normalOf(b)) < 0.999 then
 		return `normals differ ({a.id} vs {b.id})`
 	end
-	if a.outward.Unit:Dot(b.outward.Unit) > -0.999 then
+	if Seam.outwardOf(a):Dot(Seam.outwardOf(b)) > -0.999 then
 		return `outward directions are not opposite ({a.id} vs {b.id})`
 	end
 	return nil
@@ -303,10 +312,12 @@ function Seam.newTraverser(nodes: { Node }, options: TraverserOptions): Traverse
 
 	--[[ Where the root sits relative to one node, in that node's own frame. ]]
 	local function measure(at: Vector3, node: Node): (number, number, boolean)
-		local delta = at - node.point.WorldPosition
-		local along = delta:Dot(node.outward)
-		local height = delta:Dot(node.normal)
-		local lateral = (delta - node.outward * along - node.normal * height).Magnitude
+		local frame = node.point.WorldCFrame
+		local outward, normal = frame.LookVector, frame.UpVector
+		local delta = at - frame.Position
+		local along = delta:Dot(outward)
+		local height = delta:Dot(normal)
+		local lateral = (delta - outward * along - normal * height).Magnitude
 		local inMouth = height >= 0
 			and height <= options.heightTolerance
 			and lateral <= options.halfWidth
@@ -329,8 +340,11 @@ function Seam.newTraverser(nodes: { Node }, options: TraverserOptions): Traverse
 				local root = rootOf(character)
 				if root then
 					for i, node in nodes do
-						local _, _, inMouth = measure(root.Position, node)
-						if inMouth then
+						local along, _, inMouth = measure(root.Position, node)
+						-- Only what the player is already standing AT OR PAST. Disarming everything
+						-- merely inside the mouth would kill the seam for someone waiting at the lip
+						-- for the world to connect -- which is precisely the player this is for.
+						if inMouth and along >= 0 then
 							disarmed[i] = true
 						end
 					end
@@ -380,7 +394,7 @@ function Seam.newTraverser(nodes: { Node }, options: TraverserOptions): Traverse
 							and previous ~= nil
 							and previous < 0
 							and along[fromIndex] >= 0
-							and velocity:Dot(nodes[fromIndex].outward) >= options.minApproachSpeed
+							and velocity:Dot(Seam.outwardOf(nodes[fromIndex])) >= options.minApproachSpeed
 						then
 							Seam.cross(character, nodes[fromIndex], nodes[toIndex])
 							cooling = options.cooldown
