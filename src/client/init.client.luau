@@ -34,6 +34,7 @@ local Menu = require(script.Menu)
 local Demo1 = require(script.Demo1)
 local Demo2 = require(script.Demo2)
 local Demo3 = require(script.Demo3)
+local Demo4 = require(script.Demo4)
 
 local LOBBY = CFrame.new(0, 6, 24)
 local BOOT_TIMEOUT = 12
@@ -127,25 +128,11 @@ end
 -- demo registry
 --------------------------------------------------------------------------------
 
-local function locked(id: string, title: string, blurb: string): Shell.Controller
-	return {
-		id = id,
-		title = title,
-		blurb = blurb,
-		ready = false,
-		region = CFrame.new(),
-		start = function(): boolean
-			return false
-		end,
-		stop = function() end,
-	}
-end
-
 local demos: { Shell.Controller } = {
 	Demo1,
 	Demo2,
 	Demo3,
-	locked("forced", "DEMO 4 — FORCED PERSPECTIVE", "Pick a distant object up as if it were near."),
+	Demo4,
 }
 
 local activeDemo: Shell.Controller? = nil

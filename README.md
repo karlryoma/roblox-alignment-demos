@@ -9,7 +9,7 @@ not a shipped game: client-only, no server authority, placeholder art on purpose
 | 1 | **Item inspection** — a puzzle box turned in the hand, near-orthographic | built |
 | 2 | **Room-scale align-to-unlock** — walk a room, two-step chain | built |
 | 3 | **Impossible connector** — align to create a real bridge, then walk it | built |
-| 4 | Forced perspective | not built |
+| 4 | **Monument Valley traversal** — baked screen-space connectivity, rotate the world | built |
 
 ## Running it
 
@@ -143,6 +143,51 @@ reduces to perpendicular-offset / 2r, with viewing distance cancelling either wa
 only sets the scale. Clearance from every standable spot is asserted numerically: +3.5 studs
 for stage 1, +3.0 for stage 2.
 
+## Demo 4 — Monument Valley traversal
+
+<!-- GIF: demo4.gif -->
+
+← → rotate the view · `F` turns the bridge · click a tile to walk there · `R` reset · `Q` leave.
+**Wants high graphics settings** — see the caveat below.
+
+The capstone, and deliberately the odd one out. Demos 1–3 all measure the angle subtended at
+the eye — a perspective quantity — and commit on alignment. This one does neither. It is a
+**baked screen-space connectivity graph under an orthographic projection**, traversed by a
+puppet. It uses `Session`, `Shell`, `Hud` and `Damp`; it does not use `Chain`, `Orbit`,
+`Mount`, `Spin` or `Align.probe`, because angular-at-eye is the wrong measure and contorting
+those modules to fit would have produced a worse version of both.
+
+**The architectural insight is the whole demo.** The camera snaps to four fixed angles and the
+sub-model to four positions, so there are only sixteen connectivity graphs — bake them all.
+That decouples two things that look coupled:
+
+- **Rendering** uses the FOV-1 approximation and only has to fool the eye.
+- **Gameplay logic** uses a mathematically exact orthographic projection computed in
+  `Graph.project` — drop the depth component in camera space.
+
+So the illusion being approximate never leaks into correctness. There is no runtime
+screen-space measurement, no floating-point drift, and no per-frame cost: a click is answered
+by a table lookup and a BFS over a few dozen edges.
+
+Authoring an impossible join is exact rather than fitted: under a true isometric view
+(elevation 35.264°) two nodes coincide in the 45° state precisely when their difference is
+parallel to (1,1,1). So a join *is* adding (k,k,k) to a node.
+
+Verified before the code was reviewed: all four camera states produce different virtual edges,
+**no single (camera, sub-model) combination reaches the goal** — rotation is genuinely
+required, not decorative — and the monolith rejects exactly one coincidence as hidden, so the
+visibility rule is load-bearing rather than a no-op.
+
+**Crossing a virtual edge is a snap, not a slide.** Roblox gives no per-object depth sorting,
+so a puppet straddling two depths cannot be rendered correctly. Monument Valley teleports
+across the seam for the same reason.
+
+**The honest caveat.** At FOV 1 the camera sits ~2,400 studs out, and on low graphics settings
+the engine may cull the level entirely. A script *cannot* force quality — `settings()` is
+plugin-security and throws in a live game. The HUD says so. For a demo that gets filmed on max
+settings this is acceptable, but it is a real limitation rather than a hidden one. Worst-case
+perspective residual at a virtual edge is 1.2 px at 1080p, and zero at frame centre.
+
 ---
 
 ## Layout
@@ -158,7 +203,8 @@ for stage 1, +3.0 for stage 2.
 | `src/shared/Spin.luau` | View-sphere state; one integrator for drag, coast and snap. |
 | `src/shared/Damp.luau` | Framerate-independent smoothing. Every constant is a time constant. |
 | `src/client/init.client.luau` | **The shell.** The only LocalScript: menu, hosting, respawn, global restores. |
-| `src/client/Demo1/`, `Demo2/`, `Demo3/` | The demos. Each is a controller with `start(ctx)` / `stop()`. |
+| `src/client/Demo1/`…`Demo4/` | The demos. Each is a controller with `start(ctx)` / `stop()`. |
+| `src/client/Demo4/Graph.luau` | Exact ortho projection, the graph baker, BFS. Knows nothing about `Align`. |
 | `src/replicatedFirst/` | The loading screen. Requires nothing from `src/client`. |
 
 `bash scripts/check.sh` — sourcemap + `luau-lsp analyze` + `selene`. Must be 0 errors,
@@ -187,10 +233,14 @@ baseline, or the wrong-side guard goes toothless exactly where it matters.
 
 ## What is shared, and what is not
 
-`Align`, `Chain`, `Session`, `Shell` and `Damp` carry all three built demos. `Orbit` carries
+`Align`, `Chain`, `Session`, `Shell` and `Damp` carry demos 1–3. `Orbit` carries
 demos 2 and 3 — the same follow camera, with demo 3 widening the pitch clamp to -30° because
 its anchor line sits only 1.2 studs above the deck and the eye has to get *down* to it.
 
 Demo-1-only: `Mount` (a fixed-centre near-ortho rig, wrong for a walking player), `Spin`, and
 `Feedback.halo`, whose rest poses are captured in world space and only hold while the camera
 is parked.
+
+Demo 4 shares only `Session`, `Shell`, `Hud`, `Damp` and `Align.fromSpherical` (to place the
+four camera states). Its measure is *coincidence under a parallel projection*, which has no eye
+in it at all — so it brings its own `Graph` module rather than bending `Align` to fit.
