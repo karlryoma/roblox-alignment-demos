@@ -33,6 +33,7 @@ local Shell = require(ReplicatedStorage.Shared.Shell)
 local Menu = require(script.Menu)
 local Demo1 = require(script.Demo1)
 local Demo2 = require(script.Demo2)
+local Demo3 = require(script.Demo3)
 
 local LOBBY = CFrame.new(0, 6, 24)
 local BOOT_TIMEOUT = 12
@@ -143,7 +144,7 @@ end
 local demos: { Shell.Controller } = {
 	Demo1,
 	Demo2,
-	locked("connector", "DEMO 3 — IMPOSSIBLE CONNECTOR", "Two beams that only meet from one seat."),
+	Demo3,
 	locked("forced", "DEMO 4 — FORCED PERSPECTIVE", "Pick a distant object up as if it were near."),
 }
 

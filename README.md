@@ -8,7 +8,7 @@ not a shipped game: client-only, no server authority, placeholder art on purpose
 | --- | --- | --- |
 | 1 | **Item inspection** — a puzzle box turned in the hand, near-orthographic | built |
 | 2 | **Room-scale align-to-unlock** — walk a room, two-step chain | built |
-| 3 | Impossible connector | not built |
+| 3 | **Impossible connector** — align to create a real bridge, then walk it | built |
 | 4 | Forced perspective | not built |
 
 ## Running it
@@ -102,6 +102,47 @@ Correspondingly, demo 1's `atan2`-over-`acos` argument is a FOV-1 precision argu
 because a second hand-written test is exactly the two-sources-of-truth failure this codebase
 warns about, and because the *predicates* are the part that matters.
 
+## Demo 3 — Impossible connector
+
+<!-- GIF: demo3.gif -->
+
+Walk with WASD · drag to orbit · click or `E` to engage when armed · `R` reset · `Q` leave.
+
+Demo 2 proved alignment can *gate* an interaction. This is the payoff: alignment **creates
+real geometry you walk across**. Line up two sockets 40 studs apart in depth, commit, and a
+connector materialises along the true 3D line between them. Then the camera stops mattering —
+the bridge is real, it stays, and you cross it with your actual avatar. Crossing exposes a
+second pair, and a second connector reaches the goal.
+
+**This is the only demo of the four whose result is coherent from every camera in the
+server.** Demos 1, 2 and 4 are camera-relative and inherently single-viewer: the illusion
+lives inside one player's projection, and a second player standing beside them sees nothing.
+Here the alignment is merely the *trigger*; what it produces is world-space geometry every
+client would agree about. That is the difference between a trick and a mechanic that could
+ship in a multiplayer game.
+
+**Owning the seam.** From the locking seat the connector is foreshortened to nothing — that
+is the illusion. From every other angle it is a long beam hanging in space, and no amount of
+care hides that. So it is deliberately **stylised**: floating slabs with a Neon spine that
+assemble in sequence from the near anchor outward. A concrete plank bridge read off-angle
+looks like a bug; a light bridge that built itself looks like something you cast. The
+materialisation also covers the single frame in which the geometry appears.
+
+**Anchors differ in depth, never in height.** The connector is a real 3D line, so a pair
+separated vertically would look flat from the locking seat and be a steep ramp in world
+space — still walkable (`Humanoid.MaxSlopeAngle` defaults to 89°) but wrong to walk. Both
+pairs are dead level, and the slope is asserted at boot. Depth separation is also the
+*stronger* illusion, because depth is exactly what the eye cannot judge.
+
+**A deviation worth naming:** the subject sphere here is sized on the marker art rather than
+the usual half-the-baseline. With a 40-stud baseline in an open exterior, a half-baseline
+sphere is 21 studs across the middle of the chasm and the orbit camera — which swings ~10.5
+studs past the player — enters it during ordinary walking, where `probe` fails closed and the
+HUD would shout STEP BACK for no reason. The normalisation is valid for any radius (`sepNorm`
+reduces to perpendicular-offset / 2r, with viewing distance cancelling either way); the radius
+only sets the scale. Clearance from every standable spot is asserted numerically: +3.5 studs
+for stage 1, +3.0 for stage 2.
+
 ---
 
 ## Layout
@@ -117,7 +158,7 @@ warns about, and because the *predicates* are the part that matters.
 | `src/shared/Spin.luau` | View-sphere state; one integrator for drag, coast and snap. |
 | `src/shared/Damp.luau` | Framerate-independent smoothing. Every constant is a time constant. |
 | `src/client/init.client.luau` | **The shell.** The only LocalScript: menu, hosting, respawn, global restores. |
-| `src/client/Demo1/`, `Demo2/` | The demos. Each is a controller with `start(ctx)` / `stop()`. |
+| `src/client/Demo1/`, `Demo2/`, `Demo3/` | The demos. Each is a controller with `start(ctx)` / `stop()`. |
 | `src/replicatedFirst/` | The loading screen. Requires nothing from `src/client`. |
 
 `bash scripts/check.sh` — sourcemap + `luau-lsp analyze` + `selene`. Must be 0 errors,
@@ -144,12 +185,12 @@ baseline, or the wrong-side guard goes toothless exactly where it matters.
 `Workspace` node, because neither can be set from a script and the place file is not tracked
 — so a fresh clone reproduces them without anyone touching the Properties panel.
 
-## Porting to demos 3–4
+## What is shared, and what is not
 
-Demo 3 (camera orbits a fixed monument) reuses `Align`, `Chain`, `Session`, `Shell` and
-`Orbit` unchanged, and swaps `Mount.object` for `Mount.orbit`. The alignment test is written
-in world space against whatever pose was actually rendered this frame — it does not care
-whether the object moved or the camera did.
+`Align`, `Chain`, `Session`, `Shell` and `Damp` carry all three built demos. `Orbit` carries
+demos 2 and 3 — the same follow camera, with demo 3 widening the pitch clamp to -30° because
+its anchor line sits only 1.2 studs above the deck and the eye has to get *down* to it.
 
-Demo-1-only: `Demo1/Stage.luau`, and `Feedback.halo`, whose rest poses are captured in world
-space and only hold while the camera is parked.
+Demo-1-only: `Mount` (a fixed-centre near-ortho rig, wrong for a walking player), `Spin`, and
+`Feedback.halo`, whose rest poses are captured in world space and only hold while the camera
+is parked.
