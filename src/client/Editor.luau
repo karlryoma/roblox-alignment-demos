@@ -19,16 +19,22 @@
 	that is nearly free in screen terms.
 
 	ORDERING IS A SET OF CONSTRAINTS, NOT A NUDGE. "In front of the pole but behind that platform"
-	is a statement about three objects at once, and satisfying one half at a time silently undoes
-	the other. So IN FRONT OF and BEHIND SET constraints, and both are solved together every time
-	either changes: the tool computes the interval of depths that satisfies both and moves the
-	surface the shortest distance into it. When the interval is empty it says so, with the numbers
-	-- because "there is no room between these two" is a fact about the level the author needs,
-	not an error to hide.
+	is a statement about several objects at once, and satisfying one at a time silently undoes the
+	others. So IN FRONT OF and BEHIND set constraints, and all of them are re-solved together every
+	time any one changes: each becomes an interval of allowed travel along the eye ray, the
+	intervals are intersected, and the surface moves the shortest distance into the result.
 
-	Depth is compared as a RANGE (the object's whole extent along the view axis), never a centre
-	point: a platform whose centre is nearer can still have its far end poking through the thing
-	it is supposed to sit in front of.
+	DEPTH IS COMPARED WHERE THE TWO THINGS ACTUALLY OVERLAP ON SCREEN, and that is what makes
+	CYCLES possible -- A in front of B, B in front of the pole, the pole in front of A. A z-buffer
+	does not sort objects, it sorts PIXELS: if the three overlaps happen at three different places
+	in frame, each can resolve its own way and the cycle is perfectly renderable. That is precisely
+	how a Penrose triangle is built out of three ordinary beams.
+
+	An earlier version compared each object's whole depth RANGE, which forces a single total order
+	along the view axis and makes every cycle "impossible" -- a limit of the tool, not of the
+	engine. Now each constraint is measured by casting a ray from the eye through the centre of
+	that pair's screen overlap and comparing where it enters each object. Pairs that do not overlap
+	on screen cannot occlude each other at all, and are reported rather than solved.
 
 	SOLVE is the point of the whole tool. Frame the shot you want, select the surface that should
 	appear to meet another, press it, and the surface moves the exact amount that puts its seam
@@ -191,15 +197,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	local references: { Reference } = options.references or {}
 	local reference = 1
-	--[[ The two ordering constraints, solved together. Kept per selected surface, because they
-	     describe that surface's place in the stack and nothing else. ]]
-	local mustBeInFrontOf: { [Model]: Reference } = {}
-	local mustBeBehind: { [Model]: Reference } = {}
+	--[[ Ordering rules, one record per surface. Solved as a set, never one at a time. ]]
+	type Rule = { front: Reference?, back: Reference? }
+	local constraints: { [Model]: Rule } = {}
 
 	--[[
-		How much of the view axis an object occupies: the nearest and furthest depth over its whole
-		extent. A range, not a centre -- an object whose centre is nearer can still have its far
-		end poking through whatever it is meant to sit in front of.
+		How much of the view axis an object occupies. Used for the stack display and for framing;
+		ordering uses the per-overlap measurement below, because a range comparison cannot express
+		a cycle.
 	]]
 	local function depthRange(inst: Instance, camCF: CFrame): (number, number)
 		local cf: CFrame, size: Vector3
@@ -223,6 +228,132 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			end
 		end
 		return lo, hi
+	end
+
+	--[[ Screen-space bounding box of an object, in the live camera's viewport pixels. ]]
+	local function screenBox(inst: Instance): (Vector2, Vector2, boolean)
+		local cf: CFrame, size: Vector3
+		if inst:IsA("Model") then
+			cf, size = inst:GetBoundingBox()
+		elseif inst:IsA("BasePart") then
+			cf, size = inst.CFrame, inst.Size
+		else
+			return Vector2.zero, Vector2.zero, false
+		end
+		local half = size * 0.5
+		local lo = Vector2.new(math.huge, math.huge)
+		local hi = Vector2.new(-math.huge, -math.huge)
+		local anyInFront = false
+		for _, sx in { -1, 1 } do
+			for _, sy in { -1, 1 } do
+				for _, sz in { -1, 1 } do
+					local at = (cf * CFrame.new(half.X * sx, half.Y * sy, half.Z * sz)).Position
+					local point, onScreen = cam:WorldToViewportPoint(at)
+					if point.Z > 0 then
+						anyInFront = true
+						local flat = Vector2.new(point.X, point.Y)
+						lo = Vector2.new(math.min(lo.X, flat.X), math.min(lo.Y, flat.Y))
+						hi = Vector2.new(math.max(hi.X, flat.X), math.max(hi.Y, flat.Y))
+					end
+					local _ = onScreen
+				end
+			end
+		end
+		return lo, hi, anyInFront
+	end
+
+	--[[ Where a ray enters an object, as a distance from the eye. Analytic slab test against the
+	     object's own oriented box -- no CanQuery, no physics, nothing to misconfigure. ]]
+	local function rayEntry(inst: Instance, origin: Vector3, direction: Vector3): number?
+		local cf: CFrame, size: Vector3
+		if inst:IsA("Model") then
+			cf, size = inst:GetBoundingBox()
+		elseif inst:IsA("BasePart") then
+			cf, size = inst.CFrame, inst.Size
+		else
+			return nil
+		end
+		local localOrigin = cf:PointToObjectSpace(origin)
+		local localDir = cf:VectorToObjectSpace(direction)
+		local half = size * 0.5
+		local near, far = -math.huge, math.huge
+		for _, axis in { "X", "Y", "Z" } do
+			local o = (localOrigin :: any)[axis]
+			local d = (localDir :: any)[axis]
+			local h = (half :: any)[axis]
+			if math.abs(d) < 1e-9 then
+				if o < -h or o > h then
+					return nil
+				end
+			else
+				local t1 = (-h - o) / d
+				local t2 = (h - o) / d
+				if t1 > t2 then
+					t1, t2 = t2, t1
+				end
+				near = math.max(near, t1)
+				far = math.min(far, t2)
+				if near > far then
+					return nil
+				end
+			end
+		end
+		return if far < 0 then nil else math.max(near, 0)
+	end
+
+	--[[
+		The depths that decide whether one object draws in front of another: measured along a ray
+		through the centre of their screen overlap, which is the only place the comparison is
+		visible. Returns nil when they do not overlap in frame -- they cannot occlude each other
+		there, so there is nothing to order.
+	]]
+	local function overlapDepths(a: Instance, b: Instance): (number?, number?, Vector3?)
+		local aLo, aHi, aOk = screenBox(a)
+		local bLo, bHi, bOk = screenBox(b)
+		if not aOk or not bOk then
+			return nil, nil, nil
+		end
+		local lo = Vector2.new(math.max(aLo.X, bLo.X), math.max(aLo.Y, bLo.Y))
+		local hi = Vector2.new(math.min(aHi.X, bHi.X), math.min(aHi.Y, bHi.Y))
+		if lo.X > hi.X or lo.Y > hi.Y then
+			return nil, nil, nil
+		end
+		--[[
+			The centre of two overlapping bounding BOXES usually lies on neither object -- two thin
+			bars crossing diagonally have boxes that overlap over a huge region and geometry that
+			meets at a point. So the region is SAMPLED for a pixel that actually lands on both, and
+			the one nearest the centre wins. Testing only the centre made the tool report "these do
+			not overlap" for exactly the crossings a Penrose figure is made of.
+		]]
+		local best: (Vector2?) = nil
+		local bestDistance = math.huge
+		local bestA, bestB = 0, 0
+		local bestDir = Vector3.zAxis
+		local centre = (lo + hi) * 0.5
+		local GRID = 6
+		for ix = 0, GRID do
+			for iy = 0, GRID do
+				local at = Vector2.new(
+					lo.X + (hi.X - lo.X) * (ix / GRID),
+					lo.Y + (hi.Y - lo.Y) * (iy / GRID)
+				)
+				local ray = cam:ViewportPointToRay(at.X, at.Y)
+				local da = rayEntry(a, ray.Origin, ray.Direction)
+				local db = rayEntry(b, ray.Origin, ray.Direction)
+				if da and db then
+					local distance = (at - centre).Magnitude
+					if distance < bestDistance then
+						best, bestDistance = at, distance
+						bestA, bestB = da, db
+						bestDir = ray.Direction.Unit
+					end
+				end
+			end
+		end
+		if not best then
+			return nil, nil, nil
+		end
+		return bestA, bestB, bestDir
 	end
 
 	--[[ The direction to slide along so the thing being composed keeps its pixel: the ray from the
@@ -261,8 +392,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local function refreshStack(target: Target)
 		--[[ The constraints are shown persistently, not only in the last message: they are state,
 		     and state the author cannot see is state they will fight. ]]
-		local front = mustBeInFrontOf[target.model]
-		local back = mustBeBehind[target.model]
+		local rule = constraints[target.model]
+		local front = if rule then rule.front else nil
+		local back = if rule then rule.back else nil
 		if front or back then
 			stackTitle.Text = ("DEPTH STACK   must be%s%s%s"):format(
 				if front then ` in front of {front.name}` else "",
@@ -424,72 +556,83 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	end
 
 	--[[
-		Solve BOTH ordering constraints at once and move the shortest distance that satisfies them.
+		Solve every ordering constraint at once, measured where each pair actually overlaps.
 
-		Working in "depth of my nearest face", the two constraints are intervals:
-		  in front of R  =>  my FAR face must clear R's near face   =>  myLo <= R.lo - margin - span
-		  behind R       =>  my NEAR face must clear R's far face   =>  myLo >= R.hi + margin
-		Intersect, clamp the current value into it -- and when the intersection is empty, say so
-		with the numbers rather than satisfying one and silently breaking the other.
+		For one constraint, sliding the target by t along its eye ray changes its entry depth at
+		that pair's overlap ray by t * k, where k is how much of the slide points along that ray.
+		So each constraint is a linear inequality in t, the set of them is an interval, and the
+		move is the shortest one that lands inside it.
+
+		Because every pair is measured at its OWN overlap, a cycle is expressible: A can be in
+		front of B over here while the pole is in front of A over there. A z-buffer sorts pixels,
+		not objects, so nothing about that is a trick -- it is just what the hardware already does.
 	]]
 	local MARGIN = 0.5
-	local function applyConstraints(): boolean
-		local target = current()
-		if not target then
-			return false
-		end
-		local gate = options.canSolve
-		if gate and not gate() then
-			readout2.Text = "cannot reorder from here -- the view is not settled"
-			return false
-		end
-		local front = mustBeInFrontOf[target.model]
-		local back = mustBeBehind[target.model]
-		if not front and not back then
-			return false
-		end
 
-		local camCF = cam:GetRenderCFrame()
-		local myLo, myHi = depthRange(target.model, camCF)
-		if myLo == math.huge then
-			return false
+	local function applyOne(target: Target): (boolean, string?)
+		local rule = constraints[target.model]
+		if not rule or (not rule.front and not rule.back) then
+			return true, nil
 		end
-		local span = myHi - myLo
-
 		local dir = slideAxis(target)
-		local perStud = dir:Dot(camCF.LookVector)
-		if math.abs(perStud) < 1e-3 then
-			readout2.Text = "cannot reorder: this surface is edge-on to the view axis"
-			return false
-		end
-
 		local lowest, highest = -math.huge, math.huge
-		if back then
-			local _, refHi = depthRange(back.instance, camCF)
-			lowest = math.max(lowest, refHi + MARGIN)
-		end
-		if front then
-			local refLo = depthRange(front.instance, camCF)
-			highest = math.min(highest, refLo - MARGIN - span)
+		local blocked: string? = nil
+
+		local function fold(ref: Reference?, inFront: boolean)
+			if not ref or blocked then
+				return
+			end
+			local mine, theirs, rayDir = overlapDepths(target.model, ref.instance)
+			if not mine or not theirs or not rayDir then
+				blocked = `{ref.name} does not overlap this on screen -- nothing to order`
+				return
+			end
+			local k = dir:Dot(rayDir)
+			if math.abs(k) < 1e-3 then
+				blocked = "this surface slides across the view, not along it"
+				return
+			end
+			-- entry depth after travelling t:  mine + t*k
+			local limit = (theirs + (if inFront then -MARGIN else MARGIN) - mine) / k
+			if (inFront and k > 0) or (not inFront and k < 0) then
+				highest = math.min(highest, limit)
+			else
+				lowest = math.max(lowest, limit)
+			end
 		end
 
+		fold(rule.front, true)
+		fold(rule.back, false)
+		if blocked then
+			return false, blocked
+		end
 		if lowest > highest then
-			readout2.Text = ("no room: %s leaves %.1f studs and this surface is %.1f deep"):format(
-				if front and back then `{back.name} .. {front.name}` else "that pair",
-				highest - lowest + span,
-				span
-			)
-			return false
+			return false, "no travel satisfies both at once"
 		end
+		local t = math.clamp(0, lowest, highest)
+		if math.abs(t) > 1e-4 then
+			moveBy(dir * t)
+		end
+		return true, nil
+	end
 
-		local wanted = math.clamp(myLo, lowest, highest)
-		moveBy(dir * ((wanted - myLo) / perStud))
-		readout2.Text = ("ordered: %s%s%s"):format(
-			if front then `in front of {front.name}` else "",
-			if front and back then " · " else "",
-			if back then `behind {back.name}` else ""
-		)
-		return true
+	--[[
+		Relaxation: moving one object changes what another's constraint is measured against, so the
+		whole set is swept until it stops moving. A few passes is plenty for a handful of objects,
+		and failing to settle is itself the answer -- it means the arrangement is not renderable
+		and the author needs to move something else.
+	]]
+	local function solveAll(): (boolean, string?)
+		local problem: string? = nil
+		for _ = 1, 6 do
+			for _, target in targets do
+				local ok, why = applyOne(target)
+				if not ok then
+					problem = why
+				end
+			end
+		end
+		return problem == nil, problem
 	end
 
 	local function order(inFront: boolean)
@@ -498,14 +641,23 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target or not ref then
 			return
 		end
-		-- A constraint, not a one-shot move: both are re-solved together so the second can never
-		-- silently undo the first.
-		if inFront then
-			mustBeInFrontOf[target.model] = ref
-		else
-			mustBeBehind[target.model] = ref
+		local gate = options.canSolve
+		if gate and not gate() then
+			readout2.Text = "cannot reorder from here -- the view is not settled"
+			return
 		end
-		applyConstraints()
+		local rule: Rule = constraints[target.model] or {}
+		if inFront then
+			rule.front = ref
+		else
+			rule.back = ref
+		end
+		constraints[target.model] = rule
+
+		local ok, why = solveAll()
+		readout2.Text = if ok
+			then ("ordered: %s"):format(if inFront then `in front of {ref.name}` else `behind {ref.name}`)
+			else `cannot: {why}`
 		refresh()
 	end
 
@@ -597,8 +749,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			elseif code == Enum.KeyCode.BackSlash then
 				local target = current()
 				if target then
-					mustBeInFrontOf[target.model] = nil
-					mustBeBehind[target.model] = nil
+					constraints[target.model] = nil
 					readout2.Text = "constraints cleared"
 					refresh()
 				end

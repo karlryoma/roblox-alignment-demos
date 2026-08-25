@@ -230,6 +230,22 @@ toward the eye", which under these near-parallel projections barely touches the 
 side of its partner in one press. Verified: a flip leaves the seam's screen separation bit-identical
 (0.0099° before and after) and only the occlusion order changes.
 
+**Cycles are possible, and the tool models them.** "A in front of B, B in front of the pole, the
+pole in front of A" has no total order along the view axis — but a z-buffer doesn't sort objects,
+it sorts *pixels*. If the three overlaps happen at three different places in frame, each resolves
+its own way and the cycle renders perfectly. That is exactly how a Penrose triangle is built out
+of three ordinary beams.
+
+So each constraint is measured by casting a ray through the place that pair actually overlaps,
+not by comparing whole-object depth ranges (which forces a total order and calls every cycle
+impossible — a limit of the tool, not of the engine). Verified: three bars in a pinwheel settle
+into a genuine cycle after relaxation, moving 1–4 studs each.
+
+The catch is that **the pairs must overlap on screen**. Two objects that don't overlap can't
+occlude each other at all, so there is nothing to order and the editor says so. In demo 3 as it
+ships, surfaces A and B overlap but the poles overlap neither — so a three-way cycle there needs
+the pole moved into the overlap first.
+
 **Ordering against named things.** "In front of the pole but behind that platform" is a statement
 about three objects, and satisfying one half at a time silently undoes the other. So `HOME` and
 `END` set *constraints* rather than performing one-shot moves, and both are re-solved together
