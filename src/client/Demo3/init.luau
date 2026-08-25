@@ -403,6 +403,20 @@ function Demo3.start(ctx: Shell.Context): boolean
 		-- together, and SOLVE places it so that seam coincides exactly from wherever the camera
 		-- is standing right now.
 		--------------------------------------------------------------------------------
+		--[[ Plain names. The panel is read by a person composing a picture, so it should never
+		     show an internal id like "A" or "col-B". ]]
+		local FRIENDLY: { [string]: string } = {
+			A = "start walkway",
+			B = "high walkway",
+			C = "goal walkway",
+			["col-A"] = "pole under the start",
+			["col-B"] = "pole under the high walkway",
+			["col-C"] = "pole under the goal",
+		}
+		local function friendly(name: string): string
+			return FRIENDLY[name] or name
+		end
+
 		local editorTargets: { Editor.Target } = {}
 		for _, pair in Building.INTENDED do
 			for _, ends in { { pair[1], pair[2] }, { pair[2], pair[1] } } do
@@ -414,8 +428,15 @@ function Demo3.start(ctx: Shell.Context): boolean
 					end
 				end
 				local surfaceName = (spec :: Building.NodeSpec).surface
+				local partnerSurface = surfaceName
+				for _, candidate in Building.NODES do
+					if candidate.id == partnerId then
+						partnerSurface = candidate.surface
+					end
+				end
 				table.insert(editorTargets, {
-					id = `{surfaceName}  (seam {nodeId}~{partnerId})`,
+					id = friendly(surfaceName),
+					joinsTo = friendly(partnerSurface),
 					model = building.models[surfaceName],
 					seams = {
 						{
@@ -456,10 +477,10 @@ function Demo3.start(ctx: Shell.Context): boolean
 		     skirts and marker bars. ]]
 		local editorReferences: { Editor.Reference } = {}
 		for name, model in building.models do
-			table.insert(editorReferences, { name = `surface {name}`, instance = model :: Instance })
+			table.insert(editorReferences, { name = friendly(name), instance = model :: Instance })
 		end
 		for _, pole in building.occluders:GetChildren() do
-			table.insert(editorReferences, { name = `pole {pole.Name}`, instance = pole :: Instance })
+			table.insert(editorReferences, { name = friendly(pole.Name), instance = pole :: Instance })
 		end
 
 		local editor = Editor.new(editorTargets, {

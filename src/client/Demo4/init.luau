@@ -425,18 +425,34 @@ function Demo4.start(ctx: Shell.Context): boolean
 		-- camera state you are looking from. Composing the shot is a judgement about a picture;
 		-- the arithmetic is the part that belongs in code.
 		--------------------------------------------------------------------------------
+		--[[ Plain names: the panel is read by a person, not by the level file. ]]
+		local FRIENDLY: { [string]: string } = {
+			S = "start slab",
+			T = "goal slab",
+			R = "turning bridge",
+			["col-S"] = "pole under the start",
+			["col-T"] = "pole under the goal",
+		}
+		local function friendly(name: string): string
+			return FRIENDLY[name] or name
+		end
+
 		local editorTargets: { Editor.Target } = {}
 		for _, pair in Level.INTENDED do
 			for _, ends in { { pair[1], pair[2] }, { pair[2], pair[1] } } do
 				local nodeId, partnerId = ends[1], ends[2]
-				local surfaceName = ""
+				local surfaceName, partnerSurface = "", ""
 				for _, candidate in Level.NODES do
 					if candidate.id == nodeId then
 						surfaceName = candidate.surface
 					end
+					if candidate.id == partnerId then
+						partnerSurface = candidate.surface
+					end
 				end
 				table.insert(editorTargets, {
-					id = `{surfaceName}  (seam {nodeId}~{partnerId})`,
+					id = friendly(surfaceName),
+					joinsTo = friendly(partnerSurface),
 					model = level.models[surfaceName],
 					--[[ The rotor is re-posed from a stored home every time setRotor runs, so a
 					     PivotTo on the model would be erased within the frame. Move the home. ]]
@@ -488,10 +504,10 @@ function Demo4.start(ctx: Shell.Context): boolean
 		     skirts and marker bars. ]]
 		local editorReferences: { Editor.Reference } = {}
 		for name, model in level.models do
-			table.insert(editorReferences, { name = `surface {name}`, instance = model :: Instance })
+			table.insert(editorReferences, { name = friendly(name), instance = model :: Instance })
 		end
 		for _, pole in level.occluders:GetChildren() do
-			table.insert(editorReferences, { name = `pole {pole.Name}`, instance = pole :: Instance })
+			table.insert(editorReferences, { name = friendly(pole.Name), instance = pole :: Instance })
 		end
 
 		local editor = Editor.new(editorTargets, {

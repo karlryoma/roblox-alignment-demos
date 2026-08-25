@@ -67,7 +67,9 @@ export type EditorSeam = {
 }
 
 export type Target = {
+	--[[ Plain names, both of them: this panel is read by someone composing a picture. ]]
 	id: string,
+	joinsTo: string,
 	model: Model,
 	--[[ How a move is applied. Defaults to PivotTo. A demo overrides it when the model's pose is
 	     re-issued from a stored home every frame -- demo 4's rotor -- because a PivotTo would then
@@ -168,28 +170,78 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return t
 	end
 
-	local title = label(12, 15, WARN)
-	title.Text = "MAP EDITOR"
-	local who = label(34, 14, INK)
-	local readout = label(56, 13, DIM)
-	local readout2 = label(74, 13, DIM)
-	local depthOut = label(92, 13, DIM)
+	local title = label(10, 15, WARN)
+	title.Text = "MAP EDITOR                                        M closes"
+
+	--[[ Three plain sections rather than six dense lines. The panel is read while composing a
+	     picture, so it says what is happening in sentences and keeps the keys for each job next
+	     to that job. ]]
+	local editingOut = label(34, 13, INK)
+	editingOut.Size = UDim2.fromOffset(470, 74)
+	editingOut.TextYAlignment = Enum.TextYAlignment.Top
+
 	local stackTitle = label(114, 12, WARN)
-	stackTitle.Text = "DEPTH STACK  (nearest the camera first)"
-	local stackOut = label(130, 12, DIM)
-	stackOut.Size = UDim2.fromOffset(430, 78)
+	stackTitle.Text = "WHAT IS IN FRONT      nearest the camera first"
+	local stackOut = label(132, 12, DIM)
+	stackOut.Size = UDim2.fromOffset(470, 66)
 	stackOut.TextYAlignment = Enum.TextYAlignment.Top
-	local help = label(214, 12, DIM)
-	help.Size = UDim2.fromOffset(430, 110)
+
+	local orderOut = label(200, 12, DIM)
+	orderOut.Size = UDim2.fromOffset(470, 34)
+	orderOut.TextYAlignment = Enum.TextYAlignment.Top
+
+	local status = label(238, 13, GOOD)
+	status.Size = UDim2.fromOffset(470, 18)
+
+	local help = label(262, 12, DIM)
+	help.Size = UDim2.fromOffset(470, 60)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
-		"[  ]  select entry              -  =  step size",
-		"ARROWS  move on screen          PGUP/PGDN  toward / away from the eye",
-		"ENTER  SOLVE (same pixel)       Z  FLIP across the seam partner",
-		"; '  choose reference           HOME  must be IN FRONT OF it",
-		"\\  clear constraints           END   must be BEHIND it",
-		"BACKSPACE  undo this surface    P  print the edits",
+		"MOVE   arrows  across the screen        PgUp / PgDn  toward / away from camera",
+		"       -  =  step size                  Z  swap this join front / back",
+		"       BACKSPACE  undo this piece       P  print the numbers to paste back",
 	}, "\n")
+
+	--[[
+		Markers in the WORLD, not just names in a list. Without them the panel talks about "the
+		start walkway" and the author has to guess which slab that is -- which is most of why the
+		tool was hard to follow. White floats over what is being edited, amber over the reference.
+	]]
+	local function newMarker(colour: Color3): BasePart
+		local marker = Instance.new("Part")
+		marker.Name = "EditorMarker"
+		marker.Size = Vector3.new(1.6, 1.6, 1.6)
+		marker.Color = colour
+		marker.Material = Enum.Material.Neon
+		marker.Anchored = true
+		marker.CanCollide = false
+		marker.CanTouch = false
+		marker.CanQuery = false
+		marker.CastShadow = false
+		marker.Transparency = 0.15
+		marker.Parent = workspace
+		return marker
+	end
+	local selectedMarker = newMarker(Color3.fromRGB(255, 255, 255))
+	local referenceMarker = newMarker(WARN)
+
+	local function parkMarker(marker: BasePart, inst: Instance?)
+		if not inst then
+			marker.Transparency = 1
+			return
+		end
+		local cf: CFrame, size: Vector3
+		if inst:IsA("Model") then
+			cf, size = inst:GetBoundingBox()
+		elseif inst:IsA("BasePart") then
+			cf, size = inst.CFrame, inst.Size
+		else
+			marker.Transparency = 1
+			return
+		end
+		marker.Transparency = 0.15
+		marker.CFrame = cf * CFrame.new(0, size.Y * 0.5 + 2.2, 0)
+	end
 
 	local function current(): Target?
 		return targets[selected]
@@ -390,91 +442,122 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	end
 
 	local function refreshStack(target: Target)
-		--[[ The constraints are shown persistently, not only in the last message: they are state,
-		     and state the author cannot see is state they will fight. ]]
 		local rule = constraints[target.model]
 		local front = if rule then rule.front else nil
 		local back = if rule then rule.back else nil
+
+		if #references == 0 then
+			stackOut.Text = "  (this demo lists nothing to order against)"
+			orderOut.Text = ""
+			return
+		end
+
+		local camCF = cam:GetRenderCFrame()
+		local rows: { { name: string, lo: number, isRef: boolean, isMe: boolean, laps: boolean } } = {}
+		for i, ref in references do
+			local lo = depthRange(ref.instance, camCF)
+			if lo ~= math.huge then
+				--[[ Only pieces whose pixels actually meet the edited one can be ordered against it.
+				     Saying so on the row is the difference between "this rule did nothing" and
+				     understanding that there was no overlap to order in the first place. ]]
+				local mine = overlapDepths(target.model, ref.instance)
+				table.insert(rows, {
+					name = ref.name,
+					lo = lo,
+					isRef = i == reference,
+					isMe = ref.instance == target.model,
+					laps = mine ~= nil,
+				})
+			end
+		end
+		table.sort(rows, function(x, y)
+			return x.lo < y.lo
+		end)
+
+		local lines: { string } = {}
+		for _, row in rows do
+			local mark = if row.isRef then ">" else " "
+			local tag
+			if row.isMe then
+				tag = "   <- editing this"
+			elseif not row.laps then
+				tag = "   (does not overlap it on screen — nothing to order)"
+			elseif row.isRef then
+				tag = "   <- the reference"
+			else
+				tag = ""
+			end
+			table.insert(lines, ("  %s %s%s"):format(mark, row.name, tag))
+		end
+		stackOut.Text = table.concat(lines, "\n")
+
+		local chosen = references[reference]
+		local refName = if chosen then chosen.name else "nothing"
 		if front or back then
-			stackTitle.Text = ("DEPTH STACK   must be%s%s%s"):format(
+			orderOut.Text = ("  RULE: this piece must be%s%s%s        \\  clears the rule"):format(
 				if front then ` in front of {front.name}` else "",
 				if front and back then " and" else "",
 				if back then ` behind {back.name}` else ""
 			)
 		else
-			stackTitle.Text = "DEPTH STACK  (nearest the camera first)"
+			orderOut.Text = ("  HOME  put this in front of %s        ; '  pick another\n  END   put this behind %s"):format(
+				refName,
+				refName
+			)
 		end
-		if #references == 0 then
-			stackOut.Text = "  (this demo lists no reference objects)"
-			return
-		end
-		local camCF = cam:GetRenderCFrame()
-		local rows: { { name: string, lo: number, hi: number, isRef: boolean } } = {}
-		for i, ref in references do
-			local lo, hi = depthRange(ref.instance, camCF)
-			if lo ~= math.huge then
-				table.insert(rows, { name = ref.name, lo = lo, hi = hi, isRef = i == reference })
-			end
-		end
-		table.sort(rows, function(a, b)
-			return a.lo < b.lo
-		end)
-		local myLo = select(1, depthRange(target.model, camCF))
-		local lines: { string } = {}
-		for _, row in rows do
-			local mark = if row.isRef then ">" else " "
-			local mine = if math.abs(row.lo - myLo) < 0.01 then "  <= selected" else ""
-			table.insert(lines, ("%s %-22s %6.0f .. %6.0f studs%s"):format(mark, row.name, row.lo, row.hi, mine))
-		end
-		stackOut.Text = table.concat(lines, "\n")
 	end
 
 	local function refresh()
 		local target = current()
 		if not target then
-			who.Text = "no editable surfaces"
+			editingOut.Text = "nothing here can be edited"
+			stackOut.Text = ""
+			orderOut.Text = ""
+			parkMarker(selectedMarker, nil)
+			parkMarker(referenceMarker, nil)
 			return
 		end
-		refreshStack(target)
+
+		parkMarker(selectedMarker, target.model)
+		local chosen = references[reference]
+		parkMarker(referenceMarker, if chosen then chosen.instance else nil)
+
 		local offset = moved[target.model] or Vector3.zero
-		who.Text = ("[%d/%d] %s   step %.2f   moved (%.2f, %.2f, %.2f)"):format(
-			selected,
-			#targets,
-			target.id,
-			STEPS[stepIndex],
-			offset.X,
-			offset.Y,
-			offset.Z
-		)
+		local lines: { string } = {}
+		table.insert(lines, ("EDITING  %s          %d of %d    [ ]  picks another"):format(target.id, selected, #targets))
+
 		local seam = target.seams[1]
 		if seam then
-			local deg, px = separation(seam)
-			readout.Text = ("seam %s: %.1f px apart on screen (%.4f deg at the eye)"):format(seam.label, px, deg)
-			readout.TextColor3 = if px < 2 then GOOD else DIM
-			readout2.Text = if px < 2
-				then "drawn on the same pixel from here"
-				else "ENTER solves it from where you are standing"
-
-			--[[ Depth order is the whole of "what is in front of what" in Roblox, and the size
-			     penalty is what it costs: a surface pulled toward the eye is drawn that much
-			     larger, which at a wide FOV is the thing that gives the trick away. ]]
+			local _, px = separation(seam)
+			table.insert(lines, ("  should look joined to  %s"):format(target.joinsTo))
+			if px < 2 then
+				table.insert(lines, "  they are on the same pixel from here — that join is done")
+			else
+				table.insert(lines, ("  they are %.0f px apart on screen        ENTER lines them up"):format(px))
+			end
 			local mine, theirs = depths(seam)
-			local gap = mine - theirs
-				-- The ratio of the two distances is the ratio of their drawn sizes.
-		local scale = if theirs > 1e-3 then math.abs(gap) / theirs * 100 else 0
-			--[[ The percentage is not decoration: it is exactly how much the avatar's apparent size
-			     jumps when it crosses this seam, because that pop IS the depth ratio. Widen the gap
-			     to reorder the drawing and you widen the pop by the same amount. ]]
-			depthOut.Text = ("in front: %s, by %.1f studs · crossing pops the avatar %.1f%%"):format(
-				if gap < 0 then seam.node.Name else seam.partner.Name,
-				math.abs(gap),
-				scale
+			local scale = if theirs > 1e-3 then math.abs(mine - theirs) / theirs * 100 else 0
+			table.insert(
+				lines,
+				("  in front at the join: %s        crossing pops the avatar %.0f%%"):format(
+					if mine < theirs then target.id else target.joinsTo,
+					scale
+				)
 			)
 		else
-			readout.Text = "this surface carries no seam"
-			readout2.Text = ""
-			depthOut.Text = ""
+			table.insert(lines, "  this piece has no join to line up")
 		end
+		if offset.Magnitude > 1e-3 then
+			table.insert(
+				lines,
+				("  moved so far  (%.1f, %.1f, %.1f)   step %.2f"):format(offset.X, offset.Y, offset.Z, STEPS[stepIndex])
+			)
+		else
+			table.insert(lines, ("  not moved yet   step %.2f"):format(STEPS[stepIndex]))
+		end
+		editingOut.Text = table.concat(lines, "\n")
+
+		refreshStack(target)
 	end
 
 	local function moveBy(delta: Vector3)
@@ -507,7 +590,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
-			readout2.Text = "cannot solve from here -- the view is not settled"
+			status.Text = "cannot solve from here -- the view is not settled"
 			return
 		end
 		local eye = cam:GetRenderCFrame().Position
@@ -534,7 +617,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
-			readout2.Text = "cannot flip from here -- the view is not settled"
+			status.Text = "cannot flip from here -- the view is not settled"
 			return
 		end
 		local eye = cam:GetRenderCFrame().Position
@@ -548,7 +631,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if wantedDistance < 5 then
 			-- The mirror would land on top of the camera, or behind it. Refuse rather than fling
 			-- the surface through the lens.
-			readout2.Text = "cannot flip: the far side is behind the camera -- move it closer first"
+			status.Text = "cannot flip: the far side is behind the camera -- move it closer first"
 			return
 		end
 		local wanted = eye + toNode.Unit * wantedDistance
@@ -589,7 +672,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			end
 			local k = dir:Dot(rayDir)
 			if math.abs(k) < 1e-3 then
-				blocked = "this surface slides across the view, not along it"
+				blocked = `moving {target.id} does not change its depth against {ref.name} from here`
 				return
 			end
 			-- entry depth after travelling t:  mine + t*k
@@ -607,7 +690,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			return false, blocked
 		end
 		if lowest > highest then
-			return false, "no travel satisfies both at once"
+			return false, "it cannot be in front of one and behind the other from this angle"
 		end
 		local t = math.clamp(0, lowest, highest)
 		if math.abs(t) > 1e-4 then
@@ -643,7 +726,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
-			readout2.Text = "cannot reorder from here -- the view is not settled"
+			status.Text = "cannot reorder from here -- the view is not settled"
 			return
 		end
 		local rule: Rule = constraints[target.model] or {}
@@ -655,7 +738,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		constraints[target.model] = rule
 
 		local ok, why = solveAll()
-		readout2.Text = if ok
+		status.Text = if ok
 			then ("ordered: %s"):format(if inFront then `in front of {ref.name}` else `behind {ref.name}`)
 			else `cannot: {why}`
 		refresh()
@@ -750,7 +833,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				local target = current()
 				if target then
 					constraints[target.model] = nil
-					readout2.Text = "constraints cleared"
+					status.Text = "constraints cleared"
 					refresh()
 				end
 			elseif code == Enum.KeyCode.Backspace then
@@ -771,8 +854,13 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				end
 				refresh()
 				print("[editor] open — ARROWS move on screen, ENTER solves, P prints the edits")
-			elseif options.onClose then
-				options.onClose()
+			else
+				-- The markers live in the world, so they have to go when the panel does.
+				parkMarker(selectedMarker, nil)
+				parkMarker(referenceMarker, nil)
+				if options.onClose then
+					options.onClose()
+				end
 			end
 		end,
 
@@ -791,6 +879,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				c:Disconnect()
 			end
 			table.clear(connections)
+			selectedMarker:Destroy()
+			referenceMarker:Destroy()
 			gui:Destroy()
 		end,
 	}
