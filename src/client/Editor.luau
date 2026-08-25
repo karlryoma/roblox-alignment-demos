@@ -18,11 +18,22 @@
 	the same operation as "move it toward the eye" -- and under these near-parallel projections
 	that is nearly free in screen terms.
 
-	ORDERING IS A SET OF CONSTRAINTS, NOT A NUDGE. "In front of the pole but behind that platform"
-	is a statement about several objects at once, and satisfying one at a time silently undoes the
-	others. So IN FRONT OF and BEHIND set constraints, and all of them are re-solved together every
-	time any one changes: each becomes an interval of allowed travel along the eye ray, the
-	intervals are intersected, and the surface moves the shortest distance into the result.
+	WHAT THE AUTHOR EDITS IS STATEMENTS, AND STATEMENTS DO NOT EXPIRE. Two kinds: a JOIN ("these
+	two ends should meet") and a PIN ("this should read in front of that"). Both are re-established
+	by a sweep after EVERY later change, so a composition accumulates instead of coming apart as
+	soon as the next piece moves.
+
+	That is the lesson from Monument Valley, whose team built the hand-maintained version of this
+	first: "as soon as you wanted to modify that or iterate on it, you'd have to do it all over
+	again." Their fix was to derive the order from camera depth automatically -- and they credit
+	that automation with making levels easy to build at all. So the order every pair currently
+	reads is DERIVED from the live camera and shown; pins are only for the pairs that read wrong.
+
+	The two statement kinds are nearly orthogonal, which is why the sweep settles: a join is
+	satisfied by moving ACROSS the eye ray, a pin by moving ALONG it. Pins are per PAIR and a
+	surface carries as many as it likes, so "in front of the pole but behind that platform" is one
+	solve -- each pin an interval of allowed travel along the eye ray, all intersected, and the
+	surface moved the shortest distance into the result.
 
 	DEPTH IS COMPARED WHERE THE TWO THINGS ACTUALLY OVERLAP ON SCREEN, and that is what makes
 	CYCLES possible -- A in front of B, B in front of the pole, the pole in front of A. A z-buffer
@@ -181,7 +192,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	editingOut.TextYAlignment = Enum.TextYAlignment.Top
 
 	local stackTitle = label(114, 12, WARN)
-	stackTitle.Text = "WHAT IS IN FRONT      nearest the camera first"
+	stackTitle.Text = "HOW THIS PIECE READS AGAINST WHAT IT OVERLAPS"
 	local stackOut = label(132, 12, DIM)
 	stackOut.Size = UDim2.fromOffset(470, 66)
 	stackOut.TextYAlignment = Enum.TextYAlignment.Top
@@ -197,8 +208,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	help.Size = UDim2.fromOffset(470, 60)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
+		"JOIN   ENTER  join these ends and KEEP them joined      Z  swap which side is in front",
 		"MOVE   arrows  across the screen        K / I  toward / away from camera",
-		"       -  =  step size                  Z  swap this join front / back",
+		"       -  =  step size                  [ ]  another piece",
 		"       BACKSPACE  undo this piece       P  print the numbers to paste back",
 	}, "\n")
 
@@ -248,39 +260,37 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	end
 
 	local references: { Reference } = options.references or {}
-	local reference = 1
-	--[[ Ordering rules, one record per surface. Solved as a set, never one at a time. ]]
-	type Rule = { front: Reference?, back: Reference? }
-	local constraints: { [Model]: Rule } = {}
+
+	--[[ Which row of the selected piece's overlap list the ordering keys act on. The list is
+	     rebuilt from the live camera on every refresh, so this indexes what is on screen now
+	     rather than holding onto an object. ]]
+	local pairCursor = 1
 
 	--[[
-		How much of the view axis an object occupies. Used for the stack display and for framing;
-		ordering uses the per-overlap measurement below, because a range comparison cannot express
-		a cycle.
+		ORDERING IS DERIVED; THE AUTHOR ONLY STATES THE EXCEPTIONS.
+
+		An earlier version had the author declare "in front of X" and "behind Y" -- one of each,
+		per surface -- and re-solved only when a rule itself changed. Every later nudge silently
+		invalidated the rules already set, so composing a shot meant re-stating them after every
+		move. ustwo hit exactly this on Monument Valley and threw the hand-authored version away:
+		they derived the order from camera depth instead, and said the automation was what made
+		levels easy to build.
+
+		So the true order is read off the live camera and shown, the author PINS only the pairs
+		that read the wrong way round, and every pin is re-established after every change. A pin
+		is per PAIR and a surface may carry any number of them -- which is what lets a CYCLE be
+		expressed at all.
 	]]
-	local function depthRange(inst: Instance, camCF: CFrame): (number, number)
-		local cf: CFrame, size: Vector3
-		if inst:IsA("Model") then
-			cf, size = inst:GetBoundingBox()
-		elseif inst:IsA("BasePart") then
-			cf, size = inst.CFrame, inst.Size
-		else
-			return math.huge, -math.huge
-		end
-		local half = size * 0.5
-		local lo, hi = math.huge, -math.huge
-		for _, sx in { -1, 1 } do
-			for _, sy in { -1, 1 } do
-				for _, sz in { -1, 1 } do
-					local at = cf * CFrame.new(half.X * sx, half.Y * sy, half.Z * sz)
-					local depth = -(camCF:PointToObjectSpace(at.Position).Z)
-					lo = math.min(lo, depth)
-					hi = math.max(hi, depth)
-				end
-			end
-		end
-		return lo, hi
-	end
+	type Pin = { other: Reference, inFront: boolean }
+	local pins: { [Model]: { Pin } } = {}
+
+	--[[ Seams the author has declared finished. A locked seam is re-solved after every later
+	     change, so joins accumulate instead of taking turns breaking one another. ]]
+	local locked: { [string]: boolean } = {}
+
+	--[[ Assigned once the solver below exists. Declared here because moveBy, which sits above it,
+	     has to trigger a sweep after every hand nudge. ]]
+	local runSolver: (() -> (boolean, string?))? = nil
 
 	--[[ Screen-space bounding box of an object, in the live camera's viewport pixels. ]]
 	local function screenBox(inst: Instance): (Vector2, Vector2, boolean)
@@ -441,70 +451,95 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return (seam.node.WorldPosition - eye).Magnitude, (seam.partner.WorldPosition - eye).Magnitude
 	end
 
-	local function refreshStack(target: Target)
-		local rule = constraints[target.model]
-		local front = if rule then rule.front else nil
-		local back = if rule then rule.back else nil
+	--[[ Move a target without triggering a sweep: the primitive every automatic pass is built
+	     from. moveBy is the authored version and reconciles afterwards. ]]
+	local function applyDelta(target: Target, delta: Vector3)
+		if delta.Magnitude < 1e-6 then
+			return
+		end
+		local apply = target.apply
+		if apply then
+			apply(delta)
+		else
+			target.model:PivotTo(target.model:GetPivot() + delta)
+		end
+		moved[target.model] = (moved[target.model] or Vector3.zero) + delta
+	end
 
-		if #references == 0 then
-			stackOut.Text = "  (this demo lists nothing to order against)"
+	--[[ Put this seam's node on the ray from the eye through its partner, keeping its own distance
+	     from the eye, so the two are drawn on the same pixel. This only ever moves the piece
+	     ACROSS the eye ray -- depth is untouched -- which is precisely why it composes with the
+	     depth pins instead of fighting them. ]]
+	local function solveSeamRaw(target: Target, seam: EditorSeam): boolean
+		local eye = cam:GetRenderCFrame().Position
+		local toPartner = seam.partner.WorldPosition - eye
+		if toPartner.Magnitude < 1e-3 then
+			return false
+		end
+		local reach = (seam.node.WorldPosition - eye).Magnitude
+		applyDelta(target, (eye + toPartner.Unit * reach) - seam.node.WorldPosition)
+		return true
+	end
+
+	type Overlap = { ref: Reference, inFront: boolean, pinned: boolean }
+
+	--[[ Everything sharing pixels with this piece right now, each with the order the camera
+	     currently gives it. Pieces that do not overlap are left out: they cannot occlude one
+	     another, so there is nothing about them to order. ]]
+	local function overlapsFor(target: Target): { Overlap }
+		local out: { Overlap } = {}
+		local list = pins[target.model]
+		for _, ref in references do
+			if ref.instance == target.model then
+				continue
+			end
+			local mine, theirs = overlapDepths(target.model, ref.instance)
+			if not mine or not theirs then
+				continue
+			end
+			local pinned = false
+			if list then
+				for _, pin in list do
+					if pin.other.instance == ref.instance then
+						pinned = true
+					end
+				end
+			end
+			table.insert(out, { ref = ref, inFront = mine < theirs, pinned = pinned })
+		end
+		return out
+	end
+
+	local function refreshStack(target: Target, rows: { Overlap })
+		if #rows == 0 then
+			stackOut.Text = "  nothing on screen overlaps this piece, so there is nothing to order"
 			orderOut.Text = ""
 			return
 		end
+		pairCursor = math.clamp(pairCursor, 1, #rows)
 
-		local camCF = cam:GetRenderCFrame()
-		local rows: { { name: string, lo: number, isRef: boolean, isMe: boolean, laps: boolean } } = {}
-		for i, ref in references do
-			local lo = depthRange(ref.instance, camCF)
-			if lo ~= math.huge then
-				--[[ Only pieces whose pixels actually meet the edited one can be ordered against it.
-				     Saying so on the row is the difference between "this rule did nothing" and
-				     understanding that there was no overlap to order in the first place. ]]
-				local mine = overlapDepths(target.model, ref.instance)
-				table.insert(rows, {
-					name = ref.name,
-					lo = lo,
-					isRef = i == reference,
-					isMe = ref.instance == target.model,
-					laps = mine ~= nil,
-				})
-			end
-		end
-		table.sort(rows, function(x, y)
-			return x.lo < y.lo
-		end)
-
+		--[[ Read straight off the camera, every refresh. The author is being shown what IS, not a
+		     record of what they once asked for -- that record is the thing that used to go stale. ]]
 		local lines: { string } = {}
-		for _, row in rows do
-			local mark = if row.isRef then ">" else " "
-			local tag
-			if row.isMe then
-				tag = "   <- editing this"
-			elseif not row.laps then
-				tag = "   (does not overlap it on screen — nothing to order)"
-			elseif row.isRef then
-				tag = "   <- the reference"
-			else
-				tag = ""
-			end
-			table.insert(lines, ("  %s %s%s"):format(mark, row.name, tag))
+		for i, row in rows do
+			table.insert(
+				lines,
+				("  %s %s %s%s"):format(
+					if i == pairCursor then ">" else " ",
+					if row.inFront then "in front of" else "behind    ",
+					row.ref.name,
+					if row.pinned then "   [pinned]" else ""
+				)
+			)
 		end
 		stackOut.Text = table.concat(lines, "\n")
 
-		local chosen = references[reference]
-		local refName = if chosen then chosen.name else "nothing"
-		if front or back then
-			orderOut.Text = ("  RULE: this piece must be%s%s%s        \\  clears the rule"):format(
-				if front then ` in front of {front.name}` else "",
-				if front and back then " and" else "",
-				if back then ` behind {back.name}` else ""
-			)
-		else
-			orderOut.Text = ("  F  put this in front of %s        ; '  pick another\n  B  put this behind %s"):format(
-				refName,
-				refName
-			)
-		end
+		local row = rows[pairCursor]
+		orderOut.Text = ("  %s is %s %s\n  F  put it in front     B  put it behind     \\  unpin     ; '  another pair"):format(
+			target.id,
+			if row.inFront then "IN FRONT OF" else "BEHIND",
+			row.ref.name
+		)
 	end
 
 	local function refresh()
@@ -519,8 +554,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 
 		parkMarker(selectedMarker, target.model)
-		local chosen = references[reference]
-		parkMarker(referenceMarker, if chosen then chosen.instance else nil)
+		-- Scanned once per frame and shared with refreshStack below; it is the costly part here.
+		local rows = overlapsFor(target)
+		local chosen = rows[math.clamp(pairCursor, 1, math.max(#rows, 1))]
+		parkMarker(referenceMarker, if chosen then chosen.ref.instance else nil)
 
 		local offset = moved[target.model] or Vector3.zero
 		local lines: { string } = {}
@@ -530,10 +567,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if seam then
 			local _, px = separation(seam)
 			table.insert(lines, ("  should look joined to  %s"):format(target.joinsTo))
-			if px < 2 then
-				table.insert(lines, "  they are on the same pixel from here — that join is done")
+			if locked[seam.label] then
+				table.insert(lines, ("  JOINED and held (%.0f px)        ENTER releases it"):format(px))
+			elseif px < 2 then
+				table.insert(lines, "  on the same pixel        ENTER joins them for good")
 			else
-				table.insert(lines, ("  they are %.0f px apart on screen        ENTER lines them up"):format(px))
+				table.insert(lines, ("  %.0f px apart on screen        ENTER joins them"):format(px))
 			end
 			local mine, theirs = depths(seam)
 			local scale = if theirs > 1e-3 then math.abs(mine - theirs) / theirs * 100 else 0
@@ -557,7 +596,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		editingOut.Text = table.concat(lines, "\n")
 
-		refreshStack(target)
+		refreshStack(target, rows)
 	end
 
 	local function moveBy(delta: Vector3)
@@ -565,14 +604,19 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target then
 			return
 		end
-		local apply = target.apply
-		if apply then
-			apply(delta)
-		else
-			target.model:PivotTo(target.model:GetPivot() + delta)
+		applyDelta(target, delta)
+		--[[ A hand nudge is the author overruling the solver, so the join this piece was holding
+		     is released rather than snapped straight back on the next sweep. ENTER re-locks it. ]]
+		local seam = target.seams[1]
+		if seam and locked[seam.label] then
+			locked[seam.label] = nil
+			status.Text = "moved by hand -- join released, ENTER re-locks it"
 		end
-		moved[target.model] = (moved[target.model] or Vector3.zero) + delta
-		options.onChanged()
+		if runSolver then
+			runSolver()
+		else
+			options.onChanged()
+		end
 		refresh()
 	end
 
@@ -593,14 +637,24 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			status.Text = "cannot solve from here -- the view is not settled"
 			return
 		end
-		local eye = cam:GetRenderCFrame().Position
-		local toPartner = seam.partner.WorldPosition - eye
-		if toPartner.Magnitude < 1e-3 then
+		if locked[seam.label] then
+			locked[seam.label] = nil
+			status.Text = `join to {target.joinsTo} released -- it will drift again`
+			refresh()
 			return
 		end
-		local reach = (seam.node.WorldPosition - eye).Magnitude
-		local wanted = eye + toPartner.Unit * reach
-		moveBy(wanted - seam.node.WorldPosition)
+		--[[ Declaring the join, not performing it once. The sweep holds it from here on, so later
+		     work on other pieces cannot quietly pull this one apart again. ]]
+		locked[seam.label] = true
+		local ok: boolean = true
+		local why: string? = nil
+		if runSolver then
+			ok, why = runSolver()
+		end
+		status.Text = if ok
+			then `joined to {target.joinsTo} -- it will stay joined`
+			else `joined, but: {why}`
+		refresh()
 	end
 
 	--[[
@@ -639,75 +693,86 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	end
 
 	--[[
-		Solve every ordering constraint at once, measured where each pair actually overlaps.
+		Satisfy every pin at once, each measured where its pair actually overlaps.
 
-		For one constraint, sliding the target by t along its eye ray changes its entry depth at
-		that pair's overlap ray by t * k, where k is how much of the slide points along that ray.
-		So each constraint is a linear inequality in t, the set of them is an interval, and the
-		move is the shortest one that lands inside it.
+		For one pin, sliding the target by t along its eye ray changes its entry depth at that
+		pair's overlap ray by t * k, where k is how much of the slide points along that ray. So
+		each pin is a linear inequality in t, the set of them is an interval, and the move is the
+		shortest one that lands inside it. A surface carries a LIST of pins, not one front and one
+		back, so "in front of the pole but behind that platform" is a single solve.
 
 		Because every pair is measured at its OWN overlap, a cycle is expressible: A can be in
 		front of B over here while the pole is in front of A over there. A z-buffer sorts pixels,
-		not objects, so nothing about that is a trick -- it is just what the hardware already does.
+		not objects, so nothing about that is a trick -- it is what the hardware already does.
 	]]
 	local MARGIN = 0.5
 
 	local function applyOne(target: Target): (boolean, string?)
-		local rule = constraints[target.model]
-		if not rule or (not rule.front and not rule.back) then
+		local list = pins[target.model]
+		if not list or #list == 0 then
 			return true, nil
 		end
 		local dir = slideAxis(target)
 		local lowest, highest = -math.huge, math.huge
 		local blocked: string? = nil
 
-		local function fold(ref: Reference?, inFront: boolean)
-			if not ref or blocked then
-				return
-			end
-			local mine, theirs, rayDir = overlapDepths(target.model, ref.instance)
+		for _, pin in list do
+			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance)
 			if not mine or not theirs or not rayDir then
-				blocked = `{ref.name} does not overlap this on screen -- nothing to order`
-				return
+				blocked = `{pin.other.name} no longer overlaps {target.id} on screen -- nothing to order`
+				break
 			end
 			local k = dir:Dot(rayDir)
 			if math.abs(k) < 1e-3 then
-				blocked = `moving {target.id} does not change its depth against {ref.name} from here`
-				return
+				blocked = `moving {target.id} does not change its depth against {pin.other.name} from here`
+				break
 			end
 			-- entry depth after travelling t:  mine + t*k
-			local limit = (theirs + (if inFront then -MARGIN else MARGIN) - mine) / k
-			if (inFront and k > 0) or (not inFront and k < 0) then
+			local limit = (theirs + (if pin.inFront then -MARGIN else MARGIN) - mine) / k
+			if (pin.inFront and k > 0) or (not pin.inFront and k < 0) then
 				highest = math.min(highest, limit)
 			else
 				lowest = math.max(lowest, limit)
 			end
 		end
 
-		fold(rule.front, true)
-		fold(rule.back, false)
 		if blocked then
 			return false, blocked
 		end
 		if lowest > highest then
-			return false, "it cannot be in front of one and behind the other from this angle"
+			return false, `{target.id} cannot satisfy all of its pins from this angle`
 		end
 		local t = math.clamp(0, lowest, highest)
 		if math.abs(t) > 1e-4 then
-			moveBy(dir * t)
+			applyDelta(target, dir * t)
 		end
 		return true, nil
 	end
 
 	--[[
-		Relaxation: moving one object changes what another's constraint is measured against, so the
-		whole set is swept until it stops moving. A few passes is plenty for a handful of objects,
-		and failing to settle is itself the answer -- it means the arrangement is not renderable
-		and the author needs to move something else.
+		EVERYTHING THE AUTHOR HAS DECLARED, RE-ESTABLISHED AFTER EVERY CHANGE. This is the point
+		of the whole design: statements accumulate instead of quietly expiring the moment anything
+		moves.
+
+		The two kinds of statement are very nearly orthogonal -- a locked seam is satisfied by
+		moving ACROSS the eye ray (screen position), a pin by moving ALONG it (depth) -- so
+		sweeping them alternately converges in a couple of passes rather than fighting. It is a
+		sweep and not a single pass because moving one piece changes what another pin measures
+		against.
+
+		Failing to settle is itself the answer: the arrangement is not renderable from here, and
+		something the author has not pinned needs to move.
 	]]
-	local function solveAll(): (boolean, string?)
+	local function reconcile(): (boolean, string?)
 		local problem: string? = nil
-		for _ = 1, 6 do
+		for _ = 1, 4 do
+			for _, target in targets do
+				local seam = target.seams[1]
+				if seam and locked[seam.label] then
+					solveSeamRaw(target, seam)
+				end
+			end
+			problem = nil
 			for _, target in targets do
 				local ok, why = applyOne(target)
 				if not ok then
@@ -715,13 +780,17 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				end
 			end
 		end
+		options.onChanged()
 		return problem == nil, problem
 	end
+	runSolver = reconcile
 
+	--[[ Pin the highlighted pair the way the author says it should read, then re-solve everything.
+	     The pair comes from the live overlap list, so this can only ever be aimed at something
+	     that genuinely shares pixels with the selected piece. ]]
 	local function order(inFront: boolean)
 		local target = current()
-		local ref = references[reference]
-		if not target or not ref then
+		if not target then
 			return
 		end
 		local gate = options.canSolve
@@ -729,17 +798,29 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			status.Text = "cannot reorder from here -- the view is not settled"
 			return
 		end
-		local rule: Rule = constraints[target.model] or {}
-		if inFront then
-			rule.front = ref
-		else
-			rule.back = ref
+		local rows = overlapsFor(target)
+		local row = rows[pairCursor]
+		if not row then
+			status.Text = "nothing overlaps this piece, so there is no order to set"
+			return
 		end
-		constraints[target.model] = rule
 
-		local ok, why = solveAll()
+		local list: { Pin } = pins[target.model] or {}
+		local found = false
+		for _, pin in list do
+			if pin.other.instance == row.ref.instance then
+				pin.inFront = inFront
+				found = true
+			end
+		end
+		if not found then
+			table.insert(list, { other = row.ref, inFront = inFront })
+		end
+		pins[target.model] = list
+
+		local ok, why = reconcile()
 		status.Text = if ok
-			then ("ordered: %s"):format(if inFront then `in front of {ref.name}` else `behind {ref.name}`)
+			then `pinned: {target.id} {if inFront then "in front of" else "behind"} {row.ref.name}`
 			else `cannot: {why}`
 		refresh()
 	end
@@ -751,8 +832,17 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local offset = moved[target.model]
 		if offset then
+			--[[ Drop what the author declared about this piece BEFORE moving it back. A locked
+			     join or a pin would otherwise be re-established by the sweep inside moveBy and
+			     put the piece straight back where it was, which reads as "undo does nothing". ]]
+			local seam = target.seams[1]
+			if seam then
+				locked[seam.label] = nil
+			end
+			pins[target.model] = nil
 			moveBy(-offset)
 			moved[target.model] = nil
+			status.Text = `{target.id} put back -- its join and pins were released`
 			refresh()
 		end
 	end
@@ -822,10 +912,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			elseif code == Enum.KeyCode.Z then
 				flipDepth()
 			elseif code == Enum.KeyCode.Semicolon then
-				reference = ((reference - 2) % math.max(#references, 1)) + 1
+				pairCursor -= 1
 				refresh()
 			elseif code == Enum.KeyCode.Quote then
-				reference = (reference % math.max(#references, 1)) + 1
+				pairCursor += 1
 				refresh()
 			elseif code == Enum.KeyCode.F then
 				-- Home/End are Studio's too (jump to first/last in the Explorer).
@@ -835,8 +925,20 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			elseif code == Enum.KeyCode.BackSlash then
 				local target = current()
 				if target then
-					constraints[target.model] = nil
-					status.Text = "constraints cleared"
+					-- Unpin just the highlighted pair; the rest of the composition stands.
+					local rows = overlapsFor(target)
+					local row = rows[pairCursor]
+					local list = pins[target.model]
+					if row and list then
+						for i = #list, 1, -1 do
+							if list[i].other.instance == row.ref.instance then
+								table.remove(list, i)
+							end
+						end
+						status.Text = `unpinned against {row.ref.name}`
+					else
+						status.Text = "nothing pinned here"
+					end
 					refresh()
 				end
 			elseif code == Enum.KeyCode.Backspace then
