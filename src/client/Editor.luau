@@ -19,9 +19,15 @@
 	that is nearly free in screen terms.
 
 	WHAT THE AUTHOR EDITS IS STATEMENTS, AND STATEMENTS DO NOT EXPIRE. Two kinds: a JOIN ("these
-	two ends should meet") and a PIN ("this should read in front of that"). Both are re-established
-	by a sweep after EVERY later change, so a composition accumulates instead of coming apart as
-	soon as the next piece moves.
+	two ends should meet") and an ORDER ("this should be above these, under those"). Both are
+	re-established by a sweep after EVERY later change, so a composition accumulates instead of
+	coming apart as soon as the next piece moves.
+
+	ORDER IS STATED PER PIECE, NOT PER PAIR, and lives in two attributes ON the piece --
+	AlignInFrontOf and AlignBehind, each a comma-separated list of piece names. One key per listed
+	piece cycles it: in front -> behind -> don't care. There is no pair cursor and nothing to
+	navigate, and because the field belongs to the Instance, Studio's Properties window is an
+	equally good way in.
 
 	That is the lesson from Monument Valley, whose team built the hand-maintained version of this
 	first: "as soon as you wanted to modify that or iterate on it, you'd have to do it all over
@@ -123,6 +129,20 @@ export type Options = {
 	playerGui: Instance,
 }
 
+--[[ One key per listed piece. A table rather than arithmetic on KeyCode.Value, so the mapping is
+     visible and cannot drift if Roblox ever renumbers anything. ]]
+local DIGITS: { [Enum.KeyCode]: number } = {
+	[Enum.KeyCode.One] = 1,
+	[Enum.KeyCode.Two] = 2,
+	[Enum.KeyCode.Three] = 3,
+	[Enum.KeyCode.Four] = 4,
+	[Enum.KeyCode.Five] = 5,
+	[Enum.KeyCode.Six] = 6,
+	[Enum.KeyCode.Seven] = 7,
+	[Enum.KeyCode.Eight] = 8,
+	[Enum.KeyCode.Nine] = 9,
+}
+
 local STEPS = { 0.25, 0.5, 1, 2, 5 }
 -- Tab is not safe for a game to own, so selection lives on the bracket keys and the step size on
 -- minus/equals.
@@ -192,25 +212,26 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	editingOut.TextYAlignment = Enum.TextYAlignment.Top
 
 	local stackTitle = label(114, 12, WARN)
-	stackTitle.Text = "HOW THIS PIECE READS AGAINST WHAT IT OVERLAPS"
+	stackTitle.Text = "THIS PIECE SHOULD BE"
 	local stackOut = label(132, 12, DIM)
-	stackOut.Size = UDim2.fromOffset(470, 66)
+	-- Five rows: demo 3 lists six pieces and one of them is always the piece being edited.
+	stackOut.Size = UDim2.fromOffset(470, 72)
 	stackOut.TextYAlignment = Enum.TextYAlignment.Top
 
-	local orderOut = label(200, 12, DIM)
+	local orderOut = label(206, 12, DIM)
 	orderOut.Size = UDim2.fromOffset(470, 34)
 	orderOut.TextYAlignment = Enum.TextYAlignment.Top
 
-	local status = label(238, 13, GOOD)
+	local status = label(244, 13, GOOD)
 	status.Size = UDim2.fromOffset(470, 18)
 
-	local help = label(262, 12, DIM)
+	local help = label(268, 12, DIM)
 	help.Size = UDim2.fromOffset(470, 60)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
-		"JOIN   ENTER  join these ends and KEEP them joined      Z  swap which side is in front",
-		"MOVE   arrows  across the screen        K / I  toward / away from camera",
-		"       -  =  step size                  [ ]  another piece",
+		"ORDER  1-9  cycle a piece        \\  clear this piece",
+		"JOIN   ENTER  join these ends and KEEP them joined     Z  swap which side is in front",
+		"MOVE   arrows  across the screen    K / I  depth    -  =  step    [ ]  another piece",
 		"       BACKSPACE  undo this piece       P  print the numbers to paste back",
 	}, "\n")
 
@@ -261,11 +282,6 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	local references: { Reference } = options.references or {}
 
-	--[[ Which row of the selected piece's overlap list the ordering keys act on. The list is
-	     rebuilt from the live camera on every refresh, so this indexes what is on screen now
-	     rather than holding onto an object. ]]
-	local pairCursor = 1
-
 	--[[
 		ORDERING IS DERIVED; THE AUTHOR ONLY STATES THE EXCEPTIONS.
 
@@ -283,6 +299,74 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	]]
 	type Pin = { other: Reference, inFront: boolean }
 	local pins: { [Model]: { Pin } } = {}
+
+	--[[
+		WHERE THE ORDERING ACTUALLY LIVES: two attributes on the piece itself, each a plain
+		comma-separated list of piece names.
+
+		    AlignInFrontOf = "high walkway, pole under the goal"
+		    AlignBehind    = "goal walkway"
+
+		That is the whole model -- per piece, what it should be above and what it should be under.
+		Nothing is stated pair-by-pair and there is no cursor to drive.
+
+		Attributes rather than a table in this module because they are the same data seen from both
+		sides: the panel below writes them, and Roblox Studio's Properties window edits them
+		directly, with the game stopped, saving into the place file. So this is already the Studio
+		integration -- the in-game panel is a convenience over it, not the only way in.
+	]]
+	--[[ The amber marker has no cursor to follow any more, so it sits on whatever the author
+	     last changed -- which is the piece they are thinking about. ]]
+	local lastTouched: Instance? = nil
+
+	local ATTR_FRONT = "AlignInFrontOf"
+	local ATTR_BACK = "AlignBehind"
+
+	local function refByName(name: string): Reference?
+		for _, ref in references do
+			if ref.name == name then
+				return ref
+			end
+		end
+		return nil
+	end
+
+	--[[ Names that match nothing are skipped rather than treated as an error: this field is meant
+	     to be typed by hand in Studio, where a half-finished list is a normal thing to look at. ]]
+	local function parseList(raw: any, inFront: boolean, out: { Pin })
+		if typeof(raw) ~= "string" then
+			return
+		end
+		for piece in string.gmatch(raw, "[^,]+") do
+			local name = string.match(piece, "^%s*(.-)%s*$")
+			local ref = if name then refByName(name) else nil
+			if ref then
+				table.insert(out, { other = ref, inFront = inFront })
+			end
+		end
+	end
+
+	local function syncPins()
+		table.clear(pins)
+		for _, target in targets do
+			local list: { Pin } = {}
+			parseList(target.model:GetAttribute(ATTR_FRONT), true, list)
+			parseList(target.model:GetAttribute(ATTR_BACK), false, list)
+			if #list > 0 then
+				pins[target.model] = list
+			end
+		end
+	end
+
+	local function writePins(model: Model, list: { Pin })
+		local front: { string } = {}
+		local back: { string } = {}
+		for _, pin in list do
+			table.insert(if pin.inFront then front else back, pin.other.name)
+		end
+		model:SetAttribute(ATTR_FRONT, table.concat(front, ", "))
+		model:SetAttribute(ATTR_BACK, table.concat(back, ", "))
+	end
 
 	--[[ Seams the author has declared finished. A locked seam is re-solved after every later
 	     change, so joins accumulate instead of taking turns breaking one another. ]]
@@ -481,64 +565,72 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return true
 	end
 
-	type Overlap = { ref: Reference, inFront: boolean, pinned: boolean }
+	type Row = { ref: Reference, overlaps: boolean, inFront: boolean, declared: string? }
 
-	--[[ Everything sharing pixels with this piece right now, each with the order the camera
-	     currently gives it. Pieces that do not overlap are left out: they cannot occlude one
-	     another, so there is nothing about them to order. ]]
-	local function overlapsFor(target: Target): { Overlap }
-		local out: { Overlap } = {}
+	--[[ Every other piece, with what the author has DECLARED about it and how it currently READS.
+	     Non-overlapping pieces stay in the list -- the author is stating an intention, and a pair
+	     that does not share pixels yet may well do so once something moves. ]]
+	local function rowsFor(target: Target): { Row }
+		local out: { Row } = {}
 		local list = pins[target.model]
 		for _, ref in references do
 			if ref.instance == target.model then
 				continue
 			end
 			local mine, theirs = overlapDepths(target.model, ref.instance)
-			if not mine or not theirs then
-				continue
-			end
-			local pinned = false
+			local declared: string? = nil
 			if list then
 				for _, pin in list do
 					if pin.other.instance == ref.instance then
-						pinned = true
+						declared = if pin.inFront then "front" else "back"
 					end
 				end
 			end
-			table.insert(out, { ref = ref, inFront = mine < theirs, pinned = pinned })
+			local inFront = false
+			if mine and theirs then
+				inFront = mine < theirs
+			end
+			table.insert(out, {
+				ref = ref,
+				overlaps = mine ~= nil and theirs ~= nil,
+				inFront = inFront,
+				declared = declared,
+			})
 		end
 		return out
 	end
 
-	local function refreshStack(target: Target, rows: { Overlap })
+	local function refreshStack(target: Target, rows: { Row })
 		if #rows == 0 then
-			stackOut.Text = "  nothing on screen overlaps this piece, so there is nothing to order"
+			stackOut.Text = "  nothing else here to order against"
 			orderOut.Text = ""
 			return
 		end
-		pairCursor = math.clamp(pairCursor, 1, #rows)
 
-		--[[ Read straight off the camera, every refresh. The author is being shown what IS, not a
-		     record of what they once asked for -- that record is the thing that used to go stale. ]]
 		local lines: { string } = {}
 		for i, row in rows do
-			table.insert(
-				lines,
-				("  %s %s %s%s"):format(
-					if i == pairCursor then ">" else " ",
-					if row.inFront then "in front of" else "behind    ",
-					row.ref.name,
-					if row.pinned then "   [pinned]" else ""
-				)
-			)
+			local says = if row.declared == "front"
+				then "IN FRONT OF"
+				elseif row.declared == "back" then "BEHIND     "
+				else "--         "
+			--[[ What it says next to what it does. A declaration that has not taken effect is the
+			     thing the author most needs to see, and it is one glance rather than a query. ]]
+			local reads
+			if not row.overlaps then
+				reads = "no overlap yet"
+			elseif row.declared == nil then
+				reads = if row.inFront then "(in front)" else "(behind)"
+			elseif (row.declared == "front") == row.inFront then
+				reads = "ok"
+			else
+				reads = "NOT YET"
+			end
+			table.insert(lines, ("  %d %s %-28s %s"):format(i, says, row.ref.name, reads))
 		end
 		stackOut.Text = table.concat(lines, "\n")
-
-		local row = rows[pairCursor]
-		orderOut.Text = ("  %s is %s %s\n  F  put it in front     B  put it behind     \\  unpin     ; '  another pair"):format(
-			target.id,
-			if row.inFront then "IN FRONT OF" else "BEHIND",
-			row.ref.name
+		orderOut.Text = ("  press 1-%d to cycle a piece:  in front  ->  behind  ->  don't care\n  \\  clears every rule on %s"):format(
+			#rows,
+			target.id
 		)
 	end
 
@@ -555,9 +647,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 		parkMarker(selectedMarker, target.model)
 		-- Scanned once per frame and shared with refreshStack below; it is the costly part here.
-		local rows = overlapsFor(target)
-		local chosen = rows[math.clamp(pairCursor, 1, math.max(#rows, 1))]
-		parkMarker(referenceMarker, if chosen then chosen.ref.instance else nil)
+		local rows = rowsFor(target)
+		parkMarker(referenceMarker, lastTouched)
 
 		local offset = moved[target.model] or Vector3.zero
 		local lines: { string } = {}
@@ -719,8 +810,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		for _, pin in list do
 			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance)
 			if not mine or not theirs or not rayDir then
-				blocked = `{pin.other.name} no longer overlaps {target.id} on screen -- nothing to order`
-				break
+				-- Nothing shares pixels here yet, so there is nothing to enforce. Skipped rather
+				-- than failed: the author declared an intention, not a claim about right now.
+				continue
 			end
 			local k = dir:Dot(rayDir)
 			if math.abs(k) < 1e-3 then
@@ -785,10 +877,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	end
 	runSolver = reconcile
 
-	--[[ Pin the highlighted pair the way the author says it should read, then re-solve everything.
-	     The pair comes from the live overlap list, so this can only ever be aimed at something
-	     that genuinely shares pixels with the selected piece. ]]
-	local function order(inFront: boolean)
+	--[[ One key per piece: in front -> behind -> don't care. The result is written straight to the
+	     model's attributes, so the in-game panel and Studio's Properties window are editing the
+	     same field. ]]
+	local function cycleRelation(index: number)
 		local target = current()
 		if not target then
 			return
@@ -798,30 +890,39 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			status.Text = "cannot reorder from here -- the view is not settled"
 			return
 		end
-		local rows = overlapsFor(target)
-		local row = rows[pairCursor]
+		local rows = rowsFor(target)
+		local row = rows[index]
 		if not row then
-			status.Text = "nothing overlaps this piece, so there is no order to set"
 			return
 		end
 
-		local list: { Pin } = pins[target.model] or {}
-		local found = false
-		for _, pin in list do
-			if pin.other.instance == row.ref.instance then
-				pin.inFront = inFront
-				found = true
+		local kept: { Pin } = {}
+		local existing = pins[target.model]
+		if existing then
+			for _, pin in existing do
+				if pin.other.instance ~= row.ref.instance then
+					table.insert(kept, pin)
+				end
 			end
 		end
-		if not found then
-			table.insert(list, { other = row.ref, inFront = inFront })
+		local nextState: string? = if row.declared == nil
+			then "front"
+			elseif row.declared == "front" then "back"
+			else nil
+		if nextState then
+			table.insert(kept, { other = row.ref, inFront = nextState == "front" })
 		end
-		pins[target.model] = list
+
+		writePins(target.model, kept)
+		syncPins()
+		lastTouched = row.ref.instance
 
 		local ok, why = reconcile()
-		status.Text = if ok
-			then `pinned: {target.id} {if inFront then "in front of" else "behind"} {row.ref.name}`
-			else `cannot: {why}`
+		local said = if nextState == "front"
+			then `in front of {row.ref.name}`
+			elseif nextState == "back" then `behind {row.ref.name}`
+			else `no longer ordered against {row.ref.name}`
+		status.Text = if ok then `{target.id} is {said}` else `cannot: {why}`
 		refresh()
 	end
 
@@ -839,7 +940,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			if seam then
 				locked[seam.label] = nil
 			end
-			pins[target.model] = nil
+			target.model:SetAttribute(ATTR_FRONT, "")
+			target.model:SetAttribute(ATTR_BACK, "")
+			syncPins()
 			moveBy(-offset)
 			moved[target.model] = nil
 			status.Text = `{target.id} put back -- its join and pins were released`
@@ -911,34 +1014,17 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				solve()
 			elseif code == Enum.KeyCode.Z then
 				flipDepth()
-			elseif code == Enum.KeyCode.Semicolon then
-				pairCursor -= 1
-				refresh()
-			elseif code == Enum.KeyCode.Quote then
-				pairCursor += 1
-				refresh()
-			elseif code == Enum.KeyCode.F then
-				-- Home/End are Studio's too (jump to first/last in the Explorer).
-				order(true)
-			elseif code == Enum.KeyCode.B then
-				order(false)
+			elseif DIGITS[code] then
+				cycleRelation(DIGITS[code])
 			elseif code == Enum.KeyCode.BackSlash then
 				local target = current()
 				if target then
-					-- Unpin just the highlighted pair; the rest of the composition stands.
-					local rows = overlapsFor(target)
-					local row = rows[pairCursor]
-					local list = pins[target.model]
-					if row and list then
-						for i = #list, 1, -1 do
-							if list[i].other.instance == row.ref.instance then
-								table.remove(list, i)
-							end
-						end
-						status.Text = `unpinned against {row.ref.name}`
-					else
-						status.Text = "nothing pinned here"
-					end
+					-- Clear the whole piece: both attributes, one key.
+					target.model:SetAttribute(ATTR_FRONT, "")
+					target.model:SetAttribute(ATTR_BACK, "")
+					syncPins()
+					reconcile()
+					status.Text = `cleared every rule on {target.id}`
 					refresh()
 				end
 			elseif code == Enum.KeyCode.Backspace then
@@ -948,6 +1034,34 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			end
 		end)
 	)
+
+	--[[ Attributes are the source of truth, so start from whatever the place file already carries
+	     -- including anything typed into Studio's Properties window with the game stopped. ]]
+	syncPins()
+
+	--[[ ...and keep following them. Editing AlignInFrontOf in Studio while the demo runs re-solves
+	     the shot immediately, which is the whole point of keeping this in a field Studio owns. ]]
+	do
+		local seen: { [Model]: boolean } = {}
+		for _, target in targets do
+			if seen[target.model] then
+				continue
+			end
+			seen[target.model] = true
+			for _, attr in { ATTR_FRONT, ATTR_BACK } do
+				table.insert(
+					connections,
+					target.model:GetAttributeChangedSignal(attr):Connect(function()
+						syncPins()
+						if open then
+							reconcile()
+							refresh()
+						end
+					end)
+				)
+			end
+		end
+	end
 
 	local handle: Handle = {
 		toggle = function()
