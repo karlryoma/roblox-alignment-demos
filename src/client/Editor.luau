@@ -148,6 +148,8 @@ local DIGITS: { [Enum.KeyCode]: number } = {
 }
 
 local STEPS = { 0.25, 0.5, 1, 2, 5 }
+-- Degrees per tilt press, sharing the same coarse/fine index as STEPS.
+local TILT_STEPS = { 0.1, 0.25, 0.5, 1, 2 }
 -- Tab is not safe for a game to own, so selection lives on the bracket keys and the step size on
 -- minus/equals.
 
@@ -164,6 +166,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	-- Keyed by MODEL, not by entry: several entries can steer the same surface (one per seam it
 	-- carries), and they must share one accumulated offset.
 	local moved: { [PVInstance]: Vector3 } = {}
+	-- Total turn applied to a piece, for the readout and the export note.
+	local tilted: { [PVInstance]: number } = {}
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "MapEditor"
@@ -240,7 +244,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	help.Size = UDim2.fromOffset(470, 60)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
-		"ORDER  1-9  cycle a piece        \\  clear this piece",
+		"ORDER  1-9  cycle a piece        \\  clear this piece        G / H  TILT this piece",
 		"JOIN   ENTER  join these ends and KEEP them joined     Z  swap which side is in front",
 		"MOVE   arrows  across the screen    K / I  depth    -  =  step    [ ]  another piece",
 		"       BACKSPACE  undo this piece       P  print the numbers to paste back",
@@ -565,6 +569,39 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		moved[target.model] = (moved[target.model] or Vector3.zero) + delta
 	end
 
+	--[[
+		TILT: turn the piece about an axis through its seam node, so the node -- and therefore the
+		join -- does not move at all while the rest of the piece swings.
+
+		THIS IS THE DEGREE OF FREEDOM THE ILLUSION ACTUALLY NEEDS, and sliding does not have it.
+		A rigid slide shifts every part of a piece by the same depth, so it cannot change how much
+		NEARER the piece is at one overlap than at another -- and that difference is the whole
+		trick. Only turning it can. The depth spread a tilt buys is the angle times how far apart
+		the two overlaps sit on screen, which is why a Penrose triangle is built out of beams that
+		are TURNED rather than merely placed.
+
+		Because the node is the pivot, a tilt cannot break a join -- so unlike a hand nudge it does
+		not release one.
+	]]
+	local function applyTilt(target: Target, radians: number): boolean
+		if target.apply then
+			--[[ Demo 4's rotor re-issues its pose from a stored home every frame, and that hook
+			     only accepts a translation. A turn would be erased before the next frame. ]]
+			return false
+		end
+		local seam = target.seams[1]
+		local anchor = if seam then seam.node.WorldPosition else target.model:GetPivot().Position
+		local before = target.model:GetPivot()
+		local turn = CFrame.fromAxisAngle(cam:GetRenderCFrame().UpVector, radians)
+		local after = CFrame.new(anchor) * turn * CFrame.new(-anchor) * before
+		target.model:PivotTo(after)
+		--[[ Turning about a point away from the pivot DISPLACES the pivot too. The position export
+		     has to see that, or the printed numbers will not reproduce the shot. ]]
+		moved[target.model] = (moved[target.model] or Vector3.zero) + (after.Position - before.Position)
+		tilted[target.model] = (tilted[target.model] or 0) + radians
+		return true
+	end
+
 	--[[ Put this seam's node on the ray from the eye through its partner, keeping its own distance
 	     from the eye, so the two are drawn on the same pixel. This only ever moves the piece
 	     ACROSS the eye ray -- depth is untouched -- which is precisely why it composes with the
@@ -696,13 +733,25 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		else
 			table.insert(lines, "  this piece has no join to line up")
 		end
-		if offset.Magnitude > 1e-3 then
+		local turn = tilted[target.model] or 0
+		local turnText = if math.abs(turn) > 1e-4 then ("  tilted %.1f deg"):format(math.deg(turn)) else ""
+		if offset.Magnitude > 1e-3 or turnText ~= "" then
 			table.insert(
 				lines,
-				("  moved so far  (%.1f, %.1f, %.1f)   step %.2f"):format(offset.X, offset.Y, offset.Z, STEPS[stepIndex])
+				("  moved  (%.1f, %.1f, %.1f)%s   step %.2f / %.2f deg"):format(
+					offset.X,
+					offset.Y,
+					offset.Z,
+					turnText,
+					STEPS[stepIndex],
+					TILT_STEPS[stepIndex]
+				)
 			)
 		else
-			table.insert(lines, ("  not moved yet   step %.2f"):format(STEPS[stepIndex]))
+			table.insert(
+				lines,
+				("  not moved yet   step %.2f / %.2f deg"):format(STEPS[stepIndex], TILT_STEPS[stepIndex])
+			)
 		end
 		editingOut.Text = table.concat(lines, "\n")
 
@@ -721,6 +770,25 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if seam and locked[seam.label] then
 			locked[seam.label] = nil
 			say("moved by hand -- join released, ENTER re-locks it", true)
+		end
+		if runSolver then
+			runSolver()
+		else
+			options.onChanged()
+		end
+		refresh()
+	end
+
+	--[[ Tilt, then re-establish everything. A tilt pivots on the seam node, so a locked join
+	     survives it untouched -- which is why this does not release one the way a nudge does. ]]
+	local function tiltBy(radians: number)
+		local target = current()
+		if not target then
+			return
+		end
+		if not applyTilt(target, radians) then
+			say(`{target.id} cannot be tilted -- the demo drives its pose`, false)
+			return
 		end
 		if runSolver then
 			runSolver()
@@ -826,6 +894,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local blocked: string? = nil
 		local dropped: { string } = {}
 		local clash: { [Instance]: boolean } = {}
+		local short = 0
 
 		for _, pin in list do
 			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance)
@@ -852,6 +921,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				lo = math.max(lowest, limit)
 			end
 			if lo > hi then
+				--[[ How far the rules are from co-existing, in studs of DEPTH SPREAD across this
+				     piece. A slide cannot supply that -- it moves the whole piece equally -- so the
+				     number is quoted next to the keys that can. ]]
+				short = math.max(short, lo - hi)
 				table.insert(
 					dropped,
 					if pin.inFront then `in front of {pin.other.name}` else `behind {pin.other.name}`
@@ -871,7 +944,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		if #dropped > 0 then
 			conflicts[target.model] = clash
-			return false, `{target.id} cannot also be {table.concat(dropped, " and ")} from here -- ignoring that`
+			--[[ Naming the way out, not just the refusal. Sliding cannot reconcile these; turning
+			     the piece can, because that is what changes its depth from one overlap to the
+			     next. See applyTilt. ]]
+			return false,
+				`{target.id} cannot also be {table.concat(dropped, " and ")} -- {("%.1f"):format(short)} studs short. G / H tilt to make room.`
 		end
 		return true, nil
 	end
@@ -995,6 +1072,20 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				done[target.model] = true
 				any = true
 				print(("-- %s moved by (%.2f, %.2f, %.2f)"):format(target.id, offset.X, offset.Y, offset.Z))
+				local turn = tilted[target.model]
+				if turn and math.abs(turn) > 1e-4 then
+					--[[ A tilted piece is no longer described by a position alone, so print the
+					     whole orientation rather than leaving the reader to rebuild it. ]]
+					local rx, ry, rz = target.model:GetPivot():ToEulerAnglesYXZ()
+					print(
+						("--   tilted %.2f deg -- orientation CFrame.Angles(math.rad(%.3f), math.rad(%.3f), math.rad(%.3f))"):format(
+							math.deg(turn),
+							math.deg(rx),
+							math.deg(ry),
+							math.deg(rz)
+						)
+					)
+				end
 				for _, line in target.export(offset) do
 					print("   " .. line)
 				end
@@ -1049,6 +1140,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				solve()
 			elseif code == Enum.KeyCode.Z then
 				flipDepth()
+			elseif code == Enum.KeyCode.G then
+				tiltBy(-math.rad(TILT_STEPS[stepIndex]))
+			elseif code == Enum.KeyCode.H then
+				tiltBy(math.rad(TILT_STEPS[stepIndex]))
 			elseif DIGITS[code] then
 				cycleRelation(DIGITS[code])
 			elseif code == Enum.KeyCode.BackSlash then
