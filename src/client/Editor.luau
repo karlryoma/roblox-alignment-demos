@@ -168,6 +168,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local moved: { [PVInstance]: Vector3 } = {}
 	-- Total turn applied to a piece, for the readout and the export note.
 	local tilted: { [PVInstance]: number } = {}
+	--[[ The pose a piece held before the author first touched it. Undo restores this directly:
+	     translating by -offset cannot take a TILT back, so undo used to leave a piece rotated. ]]
+	local homeCF: { [PVInstance]: CFrame } = {}
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "MapEditor"
@@ -436,6 +439,13 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	     change, so joins accumulate instead of taking turns breaking one another. ]]
 	local locked: { [string]: boolean } = {}
 
+	--[[ Anything the author has actually declared. Until there is some, there is no composition
+	     to protect. ]]
+	local function hasWork(): boolean
+		return next(locked) ~= nil or next(pins) ~= nil or next(moved) ~= nil
+	end
+
+
 	--[[ Assigned once the solver below exists. Declared here because moveBy, which sits above it,
 	     has to trigger a sweep after every hand nudge. ]]
 	local runSolver: (() -> (boolean, string?))? = nil
@@ -605,6 +615,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if delta.Magnitude < 1e-6 then
 			return
 		end
+		if not homeCF[target.model] then
+			homeCF[target.model] = target.model:GetPivot()
+		end
 		local apply = target.apply
 		if apply then
 			apply(delta)
@@ -636,6 +649,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local seam = target.seams[1]
 		local anchor = if seam then seam.node.WorldPosition else target.model:GetPivot().Position
+		if not homeCF[target.model] then
+			homeCF[target.model] = target.model:GetPivot()
+		end
 		local before = target.model:GetPivot()
 		local turn = CFrame.fromAxisAngle(cam:GetRenderCFrame().UpVector, radians)
 		local after = CFrame.new(anchor) * turn * CFrame.new(-anchor) * before
@@ -744,6 +760,13 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			parkMarker(selectedMarker, nil)
 			parkMarker(referenceMarker, nil)
 			return
+		end
+
+		--[[ With nothing declared yet there is no composition to protect, so the viewpoint follows
+		     the camera. Without this, opening the tool while the orbit was still coasting latched
+		     a viewpoint the author never chose and then refused every edit against it. ]]
+		if not hasWork() then
+			composeCF = cam:GetRenderCFrame()
 		end
 
 		--[[ The loudest thing on the panel when it applies: every reading below is taken from the
@@ -925,8 +948,17 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			say("cannot flip: the far side is behind the camera -- move it closer first", false)
 			return
 		end
+		--[[ Straight through applyDelta rather than moveBy. A flip mirrors the node along the SAME
+		     eye ray, so a joined node stays on the eye-to-partner ray and the join is preserved
+		     exactly -- going via moveBy released it, which is the one thing a flip does not do. ]]
 		local wanted = eye + toNode.Unit * wantedDistance
-		moveBy(wanted - seam.node.WorldPosition)
+		applyDelta(target, wanted - seam.node.WorldPosition)
+		if runSolver then
+			runSolver()
+		else
+			options.onChanged()
+		end
+		refresh()
 	end
 
 	--[[
@@ -1110,23 +1142,44 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target then
 			return
 		end
-		local offset = moved[target.model]
-		if offset then
-			--[[ Drop what the author declared about this piece BEFORE moving it back. A locked
-			     join or a pin would otherwise be re-established by the sweep inside moveBy and
-			     put the piece straight back where it was, which reads as "undo does nothing". ]]
-			local seam = target.seams[1]
-			if seam then
-				locked[seam.label] = nil
-			end
-			target.model:SetAttribute(ATTR_FRONT, "")
-			target.model:SetAttribute(ATTR_BACK, "")
-			syncPins()
-			moveBy(-offset)
-			moved[target.model] = nil
-			say(`{target.id} put back -- its join and pins were released`, true)
-			refresh()
+		--[[ Gated BEFORE anything is touched. This used to clear the lock, wipe both attributes and
+		     drop the offset record, and only THEN call moveBy -- which refuses when the view has
+		     drifted. The piece stayed put, every rule on it was gone, and the panel said "put
+		     back". Unrecoverable, so the check comes first. ]]
+		local editable, blockedBy = canEdit()
+		if not editable then
+			say(`cannot undo: {blockedBy}`, false)
+			return
 		end
+		local home = homeCF[target.model]
+		local offset = moved[target.model]
+		if not home and not offset then
+			return
+		end
+
+		-- Release what was declared first, or the sweep re-establishes it and undo looks inert.
+		local seam = target.seams[1]
+		if seam then
+			locked[seam.label] = nil
+		end
+		target.model:SetAttribute(ATTR_FRONT, "")
+		target.model:SetAttribute(ATTR_BACK, "")
+		syncPins()
+
+		if home and not target.apply then
+			-- The whole pose, so a tilt comes back too.
+			target.model:PivotTo(home)
+		elseif offset then
+			-- Demo 4's rotor takes a translation only; its pose is re-issued from a stored home.
+			applyDelta(target, -offset)
+		end
+		moved[target.model] = nil
+		tilted[target.model] = nil
+		homeCF[target.model] = nil
+
+		reconcile()
+		say(`{target.id} put back -- its join and rules were released`, true)
+		refresh()
 	end
 
 	local function printExport()
