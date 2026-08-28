@@ -40,6 +40,7 @@ export type Handle = {
 	models: { [string]: Model },
 	surfaces: Folder,
 	occluders: Folder,
+	origin: CFrame, -- the frame the local coordinates in this file are expressed in
 	rotor: Model,
 	rotorDeck: BasePart,
 	setRotor: (turns: number) -> (),
@@ -252,6 +253,9 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 	local handle: Handle = {
 		folder = folder,
 		models = models,
+		-- Exposed so the editor can turn a moved pole's world pivot back into the local
+		-- coordinate this file is written in.
+		origin = origin,
 		surfaces = surfaces,
 		occluders = occluders,
 		rotor = rotor,

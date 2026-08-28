@@ -437,7 +437,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 				table.insert(editorTargets, {
 					id = friendly(surfaceName),
 					joinsTo = friendly(partnerSurface),
-					model = building.models[surfaceName],
+					model = building.models[surfaceName] :: PVInstance,
 					seams = {
 						{
 							node = building.attachments[nodeId],
@@ -481,6 +481,35 @@ function Demo3.start(ctx: Shell.Context): boolean
 		end
 		for _, pole in building.occluders:GetChildren() do
 			table.insert(editorReferences, { name = friendly(pole.Name), instance = pole :: Instance })
+		end
+
+		--[[ The poles are editable pieces too, not just things to be ordered against. A rule like
+		     "behind that walkway but in front of this pole" is often only satisfiable by moving the
+		     POLE, so a pole the author cannot select is a dead end in the middle of composing.
+		     They carry no seam, and the panel already handles a piece with no join. ]]
+		for _, pole in building.occluders:GetChildren() do
+			if not pole:IsA("BasePart") then
+				continue
+			end
+			local part = pole
+			table.insert(editorTargets, {
+				id = friendly(part.Name),
+				joinsTo = "nothing -- scenery",
+				model = part :: PVInstance,
+				seams = {},
+				export = function(_offset: Vector3): { string }
+					-- Straight from the live pivot, back into the frame this file is written in.
+					local at = building.origin:PointToObjectSpace(part.Position)
+					return {
+						('newPart("%s", ... , Vector3.new(%.2f, %.2f, %.2f), ...)'):format(
+							part.Name,
+							at.X,
+							at.Y,
+							at.Z
+						),
+					}
+				end,
+			})
 		end
 
 		local editor = Editor.new(editorTargets, {

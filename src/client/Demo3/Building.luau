@@ -43,6 +43,7 @@ export type Handle = {
 	boundsMax: Vector3,
 	surfaces: Folder,
 	occluders: Folder, -- ONLY these block a seam's sight line
+	origin: CFrame, -- the frame the local coordinates in this file are expressed in
 	markers: { [string]: BasePart }, -- the Neon bar at each seam mouth
 	attachments: { [string]: Attachment },
 	glow: { BasePart },
@@ -229,6 +230,9 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 	local handle: Handle = {
 		folder = folder,
 		models = models,
+		-- Exposed so the editor can turn a moved pole's world pivot back into the local
+		-- coordinate this file is written in.
+		origin = origin,
 		boundsMin = trackedMin,
 		boundsMax = trackedMax,
 		surfaces = surfaces,

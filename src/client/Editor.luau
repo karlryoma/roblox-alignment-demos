@@ -87,7 +87,11 @@ export type Target = {
 	--[[ Plain names, both of them: this panel is read by someone composing a picture. ]]
 	id: string,
 	joinsTo: string,
-	model: Model,
+	--[[ PVInstance, not Model: the occluder poles are single BaseParts and they must be movable
+	     too. A rule the author cannot satisfy by moving the piece it names is a dead end -- and
+	     "put the walkway behind that one but in front of the pole" is often only reachable by
+	     moving the pole. Everything here needs is GetPivot/PivotTo, which both classes have. ]]
+	model: PVInstance,
 	--[[ How a move is applied. Defaults to PivotTo. A demo overrides it when the model's pose is
 	     re-issued from a stored home every frame -- demo 4's rotor -- because a PivotTo would then
 	     be erased before the next frame and the panel would report a move that did not happen. ]]
@@ -159,7 +163,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local stepIndex = 3
 	-- Keyed by MODEL, not by entry: several entries can steer the same surface (one per seam it
 	-- carries), and they must share one accumulated offset.
-	local moved: { [Model]: Vector3 } = {}
+	local moved: { [PVInstance]: Vector3 } = {}
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "MapEditor"
@@ -224,6 +228,13 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	local status = label(244, 13, GOOD)
 	status.Size = UDim2.fromOffset(470, 18)
+
+	--[[ A refusal printed in the success colour reads as success at a glance -- which is exactly
+	     what happened when the solver started reporting conflicts. Outcome picks the colour. ]]
+	local function say(text: string, good: boolean)
+		status.Text = text
+		status.TextColor3 = if good then GOOD else WARN
+	end
 
 	local help = label(268, 12, DIM)
 	help.Size = UDim2.fromOffset(470, 60)
@@ -298,7 +309,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		expressed at all.
 	]]
 	type Pin = { other: Reference, inFront: boolean }
-	local pins: { [Model]: { Pin } } = {}
+	local pins: { [PVInstance]: { Pin } } = {}
 
 	--[[
 		WHERE THE ORDERING ACTUALLY LIVES: two attributes on the piece itself, each a plain
@@ -321,6 +332,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	local ATTR_FRONT = "AlignInFrontOf"
 	local ATTR_BACK = "AlignBehind"
+
+	--[[ Which of a piece's rules could not be honoured on the last sweep, so its row can say so
+	     instead of leaving the author to work out why nothing moved. ]]
+	local conflicts: { [PVInstance]: { [Instance]: boolean } } = {}
 
 	local function refByName(name: string): Reference?
 		for _, ref in references do
@@ -358,7 +373,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 	end
 
-	local function writePins(model: Model, list: { Pin })
+	local function writePins(model: PVInstance, list: { Pin })
 		local front: { string } = {}
 		local back: { string } = {}
 		for _, pin in list do
@@ -565,7 +580,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return true
 	end
 
-	type Row = { ref: Reference, overlaps: boolean, inFront: boolean, declared: string? }
+	type Row = { ref: Reference, overlaps: boolean, inFront: boolean, declared: string?, clashes: boolean }
 
 	--[[ Every other piece, with what the author has DECLARED about it and how it currently READS.
 	     Non-overlapping pieces stay in the list -- the author is stating an intention, and a pair
@@ -573,6 +588,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local function rowsFor(target: Target): { Row }
 		local out: { Row } = {}
 		local list = pins[target.model]
+		local clash = conflicts[target.model]
 		for _, ref in references do
 			if ref.instance == target.model then
 				continue
@@ -595,6 +611,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				overlaps = mine ~= nil and theirs ~= nil,
 				inFront = inFront,
 				declared = declared,
+				clashes = clash ~= nil and clash[ref.instance] == true,
 			})
 		end
 		return out
@@ -620,6 +637,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				reads = "no overlap yet"
 			elseif row.declared == nil then
 				reads = if row.inFront then "(in front)" else "(behind)"
+			elseif row.clashes then
+				reads = "CLASHES - ignored"
 			elseif (row.declared == "front") == row.inFront then
 				reads = "ok"
 			else
@@ -701,7 +720,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local seam = target.seams[1]
 		if seam and locked[seam.label] then
 			locked[seam.label] = nil
-			status.Text = "moved by hand -- join released, ENTER re-locks it"
+			say("moved by hand -- join released, ENTER re-locks it", true)
 		end
 		if runSolver then
 			runSolver()
@@ -725,12 +744,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
-			status.Text = "cannot solve from here -- the view is not settled"
+			say("cannot solve from here -- the view is not settled", false)
 			return
 		end
 		if locked[seam.label] then
 			locked[seam.label] = nil
-			status.Text = `join to {target.joinsTo} released -- it will drift again`
+			say(`join to {target.joinsTo} released -- it will drift again`, true)
 			refresh()
 			return
 		end
@@ -742,9 +761,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if runSolver then
 			ok, why = runSolver()
 		end
-		status.Text = if ok
-			then `joined to {target.joinsTo} -- it will stay joined`
-			else `joined, but: {why}`
+		say(if ok then `joined to {target.joinsTo} -- it will stay joined` else `joined, but: {why}`, ok)
 		refresh()
 	end
 
@@ -762,7 +779,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
-			status.Text = "cannot flip from here -- the view is not settled"
+			say("cannot flip from here -- the view is not settled", false)
 			return
 		end
 		local eye = cam:GetRenderCFrame().Position
@@ -776,7 +793,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if wantedDistance < 5 then
 			-- The mirror would land on top of the camera, or behind it. Refuse rather than fling
 			-- the surface through the lens.
-			status.Text = "cannot flip: the far side is behind the camera -- move it closer first"
+			say("cannot flip: the far side is behind the camera -- move it closer first", false)
 			return
 		end
 		local wanted = eye + toNode.Unit * wantedDistance
@@ -800,12 +817,15 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	local function applyOne(target: Target): (boolean, string?)
 		local list = pins[target.model]
+		conflicts[target.model] = nil
 		if not list or #list == 0 then
 			return true, nil
 		end
 		local dir = slideAxis(target)
 		local lowest, highest = -math.huge, math.huge
 		local blocked: string? = nil
+		local dropped: { string } = {}
+		local clash: { [Instance]: boolean } = {}
 
 		for _, pin in list do
 			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance)
@@ -821,22 +841,37 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			end
 			-- entry depth after travelling t:  mine + t*k
 			local limit = (theirs + (if pin.inFront then -MARGIN else MARGIN) - mine) / k
+			--[[ Fold this rule in only if it leaves somewhere to stand. One that empties the
+			     interval is DROPPED AND NAMED, so the piece still moves as far as its other rules
+			     allow. Refusing to move at all and reporting "cannot satisfy all of its pins" left
+			     the author with a piece that had not budged and no idea which rule was at fault. ]]
+			local lo, hi = lowest, highest
 			if (pin.inFront and k > 0) or (not pin.inFront and k < 0) then
-				highest = math.min(highest, limit)
+				hi = math.min(highest, limit)
 			else
-				lowest = math.max(lowest, limit)
+				lo = math.max(lowest, limit)
+			end
+			if lo > hi then
+				table.insert(
+					dropped,
+					if pin.inFront then `in front of {pin.other.name}` else `behind {pin.other.name}`
+				)
+				clash[pin.other.instance] = true
+			else
+				lowest, highest = lo, hi
 			end
 		end
 
 		if blocked then
 			return false, blocked
 		end
-		if lowest > highest then
-			return false, `{target.id} cannot satisfy all of its pins from this angle`
-		end
 		local t = math.clamp(0, lowest, highest)
 		if math.abs(t) > 1e-4 then
 			applyDelta(target, dir * t)
+		end
+		if #dropped > 0 then
+			conflicts[target.model] = clash
+			return false, `{target.id} cannot also be {table.concat(dropped, " and ")} from here -- ignoring that`
 		end
 		return true, nil
 	end
@@ -887,7 +922,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
-			status.Text = "cannot reorder from here -- the view is not settled"
+			say("cannot reorder from here -- the view is not settled", false)
 			return
 		end
 		local rows = rowsFor(target)
@@ -922,7 +957,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			then `in front of {row.ref.name}`
 			elseif nextState == "back" then `behind {row.ref.name}`
 			else `no longer ordered against {row.ref.name}`
-		status.Text = if ok then `{target.id} is {said}` else `cannot: {why}`
+		say(if ok then `{target.id} is {said}` else `{why}`, ok)
 		refresh()
 	end
 
@@ -945,7 +980,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			syncPins()
 			moveBy(-offset)
 			moved[target.model] = nil
-			status.Text = `{target.id} put back -- its join and pins were released`
+			say(`{target.id} put back -- its join and pins were released`, true)
 			refresh()
 		end
 	end
@@ -953,7 +988,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local function printExport()
 		print("---- map edits ----")
 		local any = false
-		local done: { [Model]: boolean } = {}
+		local done: { [PVInstance]: boolean } = {}
 		for _, target in targets do
 			local offset = moved[target.model]
 			if offset and offset.Magnitude > 1e-4 and not done[target.model] then
@@ -1024,7 +1059,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 					target.model:SetAttribute(ATTR_BACK, "")
 					syncPins()
 					reconcile()
-					status.Text = `cleared every rule on {target.id}`
+					say(`cleared every rule on {target.id}`, true)
 					refresh()
 				end
 			elseif code == Enum.KeyCode.Backspace then
@@ -1042,7 +1077,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	--[[ ...and keep following them. Editing AlignInFrontOf in Studio while the demo runs re-solves
 	     the shot immediately, which is the whole point of keeping this in a field Studio owns. ]]
 	do
-		local seen: { [Model]: boolean } = {}
+		local seen: { [PVInstance]: boolean } = {}
 		for _, target in targets do
 			if seen[target.model] then
 				continue
