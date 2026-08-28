@@ -110,7 +110,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 
 		local level = Level.build(origin, workspace)
 		s.add(level.destroy)
-		ctx.place(level.spawnCF)
+		ctx.place(level.spawnCF())
 
 		--------------------------------------------------------------------------------
 		-- camera: four fixed poses, written every frame
@@ -286,7 +286,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 		local rotorPrevCF = level.rotor:GetPivot()
 		local riding = false
 		local yawNow = math.rad(TUNE.yawDeg[camState + 1])
-		local lastSafe = level.spawnCF
+		local lastSafe = level.spawnCF()
 		local solved = false
 		local resetQueued = false
 		local prox = 0
@@ -402,6 +402,8 @@ function Demo4.start(ctx: Shell.Context): boolean
 			hud.setState("turning the bridge")
 		end
 
+		local HINT = "← → turn the view · F turns the bridge · M edits the map · R reset · Q to leave"
+
 		local function resetDemo()
 			turning = 0
 			camState = 1
@@ -410,11 +412,11 @@ function Demo4.start(ctx: Shell.Context): boolean
 			level.setRotor(rotorState)
 			rotorPrevCF = level.rotor:GetPivot()
 			yawNow = math.rad(TUNE.yawDeg[camState + 1])
-			ctx.place(level.spawnCF)
-			lastSafe = level.spawnCF
+			ctx.place(level.spawnCF())
+			lastSafe = level.spawnCF()
 			setWalkable(true)
 			installGraph()
-			hud.setHint("← → turn the view · F turns the bridge · M edits the map · R reset · Q to leave")
+			hud.setHint(HINT)
 		end
 
 		--------------------------------------------------------------------------------
@@ -467,14 +469,20 @@ function Demo4.start(ctx: Shell.Context): boolean
 					export = function(offset: Vector3): { string }
 						local lines: { string } = {}
 						if surfaceName == "R" then
-							--[[ The rotor is placed by ROTOR_PIVOT and its nodes are authored in the
-							     rotor's own rest frame, so they do not move with it: one line. ]]
-							local moved = Level.ROTOR_PIVOT + offset
+							--[[ ROTOR_PIVOT places the deck, but the rotor's NODES are authored as
+							     region-frame absolutes (Level.build writes origin * node.at into
+							     WorldCFrame) -- so the pivot line alone is a lie: pasting it moved
+							     the deck and left the seam attachments hanging at the old spots.
+							     Fall through so the NODES loop below emits R_a/R_b as well. ]]
+							local movedPivot = Level.ROTOR_PIVOT + offset
 							table.insert(
 								lines,
-								("Level.ROTOR_PIVOT = Vector3.new(%.2f, %.2f, %.2f)"):format(moved.X, moved.Y, moved.Z)
+								("Level.ROTOR_PIVOT = Vector3.new(%.2f, %.2f, %.2f)"):format(
+									movedPivot.X,
+									movedPivot.Y,
+									movedPivot.Z
+								)
 							)
-							return lines
 						end
 						local at = Level.SURFACE_AT[surfaceName]
 						if at then
@@ -555,11 +563,16 @@ function Demo4.start(ctx: Shell.Context): boolean
 				editing = true
 				traverser.setGraph(nil, nil)
 				setWalkable(false)
+				--[[ The standing hint still claims the arrow keys turn the view, but the editor
+				     owns them while open -- a few stray presses moved the level by whole studs
+				     with nothing on screen saying so. ]]
+				hud.setHint(", . turn the view · F turns the bridge · arrows nudge the piece · M closes")
 			end,
 			onClose = function()
 				editing = false
 				setWalkable(turning <= 0)
 				installGraph()
+				hud.setHint(HINT)
 			end,
 			-- Mid-rotation the camera is showing an angle the game can never settle at, so
 			-- authoring against it would bake a state that does not exist.
@@ -602,9 +615,11 @@ function Demo4.start(ctx: Shell.Context): boolean
 				return
 			end
 
-			--[[ Past the view turn, an open editor owns the keyboard: F would drive the rotor
-			     against the very home pose being edited, and Q/R would drop the work. ]]
-			if editor.isOpen() then
+			--[[ Past the view turn, an open editor owns most of the keyboard -- Q/R would drop the
+			     work. F stays LIVE: the second seam is composed at the other rotor state, so
+			     flipping the rotor is part of every real authoring session (edits move the rotor's
+			     HOME, which survives the turn -- the old fear of F fighting the edit is stale). ]]
+			if editor.isOpen() and code ~= Enum.KeyCode.F then
 				return
 			end
 
@@ -625,7 +640,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 			-- prepareCharacter hands a fresh Humanoid its walking speed back, which would lift the
 			-- rotation freeze for the rest of the tween -- with no graph installed and the movement
 			-- basis still swinging. The freeze is the authority here.
-			setWalkable(turning <= 0)
+			setWalkable(turning <= 0 and not editor.isOpen())
 			riding = false
 		end)
 
@@ -712,7 +727,7 @@ function Demo4.start(ctx: Shell.Context): boolean
 		end
 
 		installGraph()
-		hud.setHint("← → turn the view · F turns the bridge · M edits the map · R reset · Q to leave · wants high graphics")
+		hud.setHint(HINT)
 
 		--------------------------------------------------------------------------------
 		-- THE FRAME LOOP
@@ -754,7 +769,10 @@ function Demo4.start(ctx: Shell.Context): boolean
 					else
 						yawNow = math.rad(TUNE.yawDeg[camState + 1])
 					end
-					setWalkable(true)
+					--[[ Not unconditionally: a view or rotor turn finishing while the editor is
+					     open used to hand the avatar its walk speed back mid-edit, and Up/Down
+					     then nudged the piece AND walked the character off the slab. ]]
+					setWalkable(not editor.isOpen())
 					installGraph()
 				end
 			end

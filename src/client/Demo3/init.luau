@@ -111,7 +111,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 
 		local building = Building.build(origin, workspace)
 		s.add(building.destroy)
-		ctx.place(building.spawnCF)
+		ctx.place(building.spawnCF())
 
 		--------------------------------------------------------------------------------
 		-- the seam graph
@@ -266,11 +266,17 @@ function Demo3.start(ctx: Shell.Context): boolean
 			end
 		end)
 
-		local lastSafe = building.spawnCF
+		local lastSafe = building.spawnCF()
+		--[[ Assigned in the editor wiring below. A respawn hands the fresh Humanoid its walking
+		     speed back, which silently discarded the editor's WalkSpeed-0 freeze mid-edit. ]]
+		local refreezeForEditor: (() -> ())? = nil
 		ctx.onCharacter(function()
 			prepareCharacter()
 			refreshCameraFilter()
 			Shell.placeCharacter(ctx.player, lastSafe)
+			if refreezeForEditor then
+				refreezeForEditor()
+			end
 		end)
 
 		--------------------------------------------------------------------------------
@@ -307,6 +313,8 @@ function Demo3.start(ctx: Shell.Context): boolean
 		--------------------------------------------------------------------------------
 		local settled = false
 		local editing = false
+		-- Assigned in the editor wiring below; settle() is defined before the editor exists.
+		local editorHasTilt: (() -> boolean)? = nil
 		local stillFor = 0
 		local prevYaw, prevPitch = orbit.get()
 		local settleYaw, settlePitch = 0, 0
@@ -379,17 +387,27 @@ function Demo3.start(ctx: Shell.Context): boolean
 				end
 				hud.setState(`WOVEN — {table.concat(names, ", ")}`)
 				hud.setHint("walk into a lit seam")
+			elseif graph.rejectedOrientation > 0 and editorHasTilt ~= nil and editorHasTilt() then
+				--[[ A pair LINES UP from here but its faces no longer oppose, AND a tilt exists to
+				     blame. The tilt condition matters: three authored pairs coincide at reachable
+				     angles with faces ninety degrees apart, and blaming a tilt on a pristine map
+				     would send the author undoing edits they never made. ]]
+				hud.setState("SETTLED — a seam lines up here but its faces no longer oppose")
+				hud.setHint("a tilted piece? M opens the editor, BACKSPACE puts it back")
+			elseif graph.rejectedHidden > 0 then
+				hud.setState("SETTLED — a seam lines up here but a pole hides it")
+				hud.setHint("try another angle · M edits the map")
 			else
 				hud.setState("SETTLED — nothing coincides from here")
-				hud.setHint("try another angle")
+				hud.setHint("try another angle · drag orbits · M edits the map")
 			end
 		end
 
 		local function resetDemo()
 			unsettle()
 			solved = false
-			ctx.place(building.spawnCF)
-			lastSafe = building.spawnCF
+			ctx.place(building.spawnCF())
+			lastSafe = building.spawnCF()
 			orbit.set(math.rad(TUNE.startYawDeg), math.rad(TUNE.startPitchDeg))
 			prevYaw, prevPitch = orbit.get()
 			stillFor = 0
@@ -472,6 +490,22 @@ function Demo3.start(ctx: Shell.Context): boolean
 		end
 
 		local editorFreeze: (() -> ())? = nil
+		--[[ Zero the CURRENT humanoid's WalkSpeed and remember how to give it back. A function
+		     because two moments need it: opening the editor, and a respawn while it is open --
+		     the fresh Humanoid arrives walking, and the old freeze holds a dead reference. ]]
+		local function freezeAvatar()
+			local character = ctx.player.Character
+			local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+			if humanoid then
+				local walk = humanoid.WalkSpeed
+				humanoid.WalkSpeed = 0
+				editorFreeze = function()
+					if humanoid.Parent then
+						humanoid.WalkSpeed = walk
+					end
+				end
+			end
+		end
 		--[[ What the ordering commands can place things relative to: every walkable surface and
 		     every pole. Curated rather than a descendant walk, which would bury the list in
 		     skirts and marker bars. ]]
@@ -527,17 +561,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 			onOpen = function()
 				editing = true
 				traverser.setGraph(nil, nil)
-				local character = ctx.player.Character
-				local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
-				if humanoid then
-					local walk = humanoid.WalkSpeed
-					humanoid.WalkSpeed = 0
-					editorFreeze = function()
-						if humanoid.Parent then
-							humanoid.WalkSpeed = walk
-						end
-					end
-				end
+				freezeAvatar()
 			end,
 			onClose = function()
 				editing = false
@@ -557,6 +581,12 @@ function Demo3.start(ctx: Shell.Context): boolean
 			end
 		end)
 		s.add(editor.destroy)
+		refreezeForEditor = function()
+			if editor.isOpen() then
+				freezeAvatar()
+			end
+		end
+		editorHasTilt = editor.hasTiltWork
 
 		local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
 			if processed then

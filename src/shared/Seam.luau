@@ -166,10 +166,16 @@ function Seam.orientationFault(a: Node, b: Node): string?
 	-- translation the player feels as a shove.
 	-- Both come off a CFrame, so they are unit by construction; the checks below mean what they
 	-- say without any normalising.
-	if Seam.normalOf(a):Dot(Seam.normalOf(b)) < 0.999 then
+	--[[ 0.985 (~10 deg), not 0.999 (~2.6 deg). The editor's TILT is a sanctioned authoring move
+	     and its coarse step is 2 deg -- under the old tolerance two presses disqualified a seam
+	     FOREVER while it still lined up on screen, which read as "the game is broken". The
+	     crossing itself is a pure translation, so a sub-10-deg mouth mismatch changes nothing the
+	     player can feel; the check still exists to catch genuinely wrong pairings (perpendicular
+	     walls, same-facing mouths), which fail it by 90 deg, not 4. ]]
+	if Seam.normalOf(a):Dot(Seam.normalOf(b)) < 0.985 then
 		return `normals differ ({a.id} vs {b.id})`
 	end
-	if Seam.outwardOf(a):Dot(Seam.outwardOf(b)) > -0.999 then
+	if Seam.outwardOf(a):Dot(Seam.outwardOf(b)) > -0.985 then
 		return `outward directions are not opposite ({a.id} vs {b.id})`
 	end
 	return nil

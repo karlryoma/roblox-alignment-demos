@@ -52,7 +52,7 @@ export type Handle = {
 	attachments: { [string]: Attachment },
 	markers: { [string]: BasePart },
 	bars: { BasePart },
-	spawnCF: CFrame,
+	spawnCF: () -> CFrame,
 	goal: BasePart,
 	centre: Vector3,
 	boundsMin: Vector3,
@@ -267,7 +267,12 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 		markers = markers,
 		bars = bars,
 		-- An offset from the start surface's own pivot, so an edited map spawns on the moved slab.
-		spawnCF = models[Level.START_SURFACE]:GetPivot() * CFrame.new(0, 4, 3),
+		-- A FUNCTION of the live pivot: the editor (and the sweep holding a locked join) moves
+		-- slab S, and a spawn frozen at build time dropped the player into mid-air at the old
+		-- spot, with the fall catch looping them there.
+		spawnCF = function()
+			return models[Level.START_SURFACE]:GetPivot() * CFrame.new(0, 4, 3)
+		end,
 		goal = goal,
 		centre = Vector3.new(-1, 4.5, -10),
 		boundsMin = trackedMin,

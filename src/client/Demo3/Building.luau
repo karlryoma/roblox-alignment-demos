@@ -47,7 +47,7 @@ export type Handle = {
 	markers: { [string]: BasePart }, -- the Neon bar at each seam mouth
 	attachments: { [string]: Attachment },
 	glow: { BasePart },
-	spawnCF: CFrame,
+	spawnCF: () -> CFrame,
 	goal: BasePart,
 	centre: Vector3,
 	destroy: () -> (),
@@ -240,9 +240,13 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 		markers = markers,
 		attachments = attachments,
 		glow = glow,
-		-- On surface A, facing -Z: the first seam is at the far end of the walkway. Expressed as an
-		-- offset from the surface's own pivot below, so an edited map spawns on the moved walkway.
-		spawnCF = models[Building.START_SURFACE]:GetPivot() * CFrame.new(0, 4, 6),
+		-- On surface A, facing -Z: the first seam is at the far end of the walkway. A FUNCTION of
+		-- the live pivot, not a value: the editor moves this walkway, and a spawn frozen at build
+		-- time then dropped the player into mid-air where the walkway used to be -- with the fall
+		-- catch teleporting them back to the same empty spot forever.
+		spawnCF = function()
+			return models[Building.START_SURFACE]:GetPivot() * CFrame.new(0, 4, 6)
+		end,
 		goal = goal,
 		centre = Vector3.new(7.5, 6, 0),
 		destroy = function()

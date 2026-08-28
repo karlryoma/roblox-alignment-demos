@@ -105,6 +105,10 @@ export type Target = {
 export type Handle = {
 	toggle: () -> (),
 	isOpen: () -> boolean,
+	--[[ Whether any piece currently carries a tilt. A demo's "faces no longer oppose" hint must
+	     only blame a tilt when one exists -- the authored maps have pairs that coincide at some
+	     angles with faces ninety degrees apart, and those are nobody's mistake. ]]
+	hasTiltWork: () -> boolean,
 	step: (dt: number) -> (),
 	destroy: () -> (),
 }
@@ -358,8 +362,16 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not held then
 			return true
 		end
+		--[[ Direction, and only the displacement ACROSS the view. Both demos refit the camera
+		     standoff after every edit (onChanged -> fitDistance), which moves the eye 3-12 studs
+		     ALONG the view ray -- and motion along the ray does not change the composition under
+		     these near-parallel projections (the header says exactly this). A raw position test
+		     tripped on that refit, so the tool refused the very next keypress after every nudge
+		     and had to be un-stuck with C each time. ]]
 		local live = cam:GetRenderCFrame()
-		if (live.Position - held.Position).Magnitude > 1 then
+		local delta = live.Position - held.Position
+		local across = delta - held.LookVector * delta:Dot(held.LookVector)
+		if across.Magnitude > 2 then
 			return false
 		end
 		return live.LookVector:Dot(held.LookVector) >= COMPOSE_DOT
@@ -369,7 +381,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	     gate by accident -- which is exactly how moveBy and the tilt keys came to be ungated. ]]
 	local function canEdit(): (boolean, string?)
 		if not atComposeView() then
-			return false, "orbited away from the composition view -- orbit back, or C composes from here"
+			return false, "the view has drifted from the composition -- C composes from here"
 		end
 		local gate = options.canSolve
 		if gate and not gate() then
@@ -435,9 +447,34 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		model:SetAttribute(ATTR_BACK, table.concat(back, ", "))
 	end
 
-	--[[ Seams the author has declared finished. A locked seam is re-solved after every later
-	     change, so joins accumulate instead of taking turns breaking one another. ]]
-	local locked: { [string]: boolean } = {}
+	--[[
+		Seams the author has declared finished. A locked seam is re-solved after every later
+		change, so joins accumulate instead of taking turns breaking one another.
+
+		EACH LOCK REMEMBERS THE VIEW IT WAS COMPOSED AT. These levels are DESIGNED around seams
+		that coincide from DIFFERENT views (demo 3: yaw 45 vs yaw 135; demo 4: different
+		camera/rotor states), so re-solving every lock from the live camera -- what this used to
+		do -- forced them all onto ONE eye ray: composing the second seam physically dragged the
+		first walkway ~20 studs to align from the new angle. That was the single largest source of
+		"the alignment is very off".
+
+		partnerBase + partnerMovedBase let the join FOLLOW the partner when the author later moves
+		it (the moved[] delta since lock time), while ignoring motion the editor did not do --
+		demo 4's rotor swinging between states must not drag a slab composed at the other state.
+	]]
+	--[[ BOTH ends are stored as compose-time bases plus author-moved deltas. The first version
+	     shielded only the partner side, and the rotor -- a lockable TARGET whose own nodes swing
+	     ~8.5 studs between states -- got its home dragged by the sweep after every F flip: the
+	     live node position was solved onto the stored ray as if the swing were an author edit. ]]
+	type Lock = {
+		eye: Vector3,
+		nodeBase: Vector3,
+		nodeMovedBase: Vector3,
+		partnerBase: Vector3,
+		partnerModel: Model?,
+		partnerMovedBase: Vector3,
+	}
+	local locked: { [string]: Lock } = {}
 
 	--[[ Anything the author has actually declared. Until there is some, there is no composition
 	     to protect. ]]
@@ -663,18 +700,47 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return true
 	end
 
+	--[[ Where a lock's partner is FOR SOLVING: where it stood at compose time, plus whatever the
+	     author has moved it since. The live position is deliberately not consulted -- demo 4's
+	     rotor swings its attachments between states, and a lock composed at one state must not
+	     chase the swing. ]]
+	local function lockPartnerPos(lock: Lock): Vector3
+		local pos = lock.partnerBase
+		local pm = lock.partnerModel
+		if pm then
+			pos += (moved[pm] or Vector3.zero) - lock.partnerMovedBase
+		end
+		return pos
+	end
+
+	--[[ Where the lock's OWN node stands in authored terms: compose-time base plus what the
+	     author has moved the piece since. For a slab this equals the live position; for the
+	     rotor it deliberately does not -- the swing is display, not authoring. ]]
+	local function lockNodePos(lock: Lock, target: Target): Vector3
+		return lock.nodeBase + (moved[target.model] or Vector3.zero) - lock.nodeMovedBase
+	end
+
+	--[[ The same test Seam.build applies -- checked HERE so the tool can warn at the moment a
+	     tilt (or a join attempt on a tilted piece) crosses it, instead of the seam silently never
+	     arming and the HUD reporting "nothing coincides". ]]
+	local function seamOrientationFault(seam: EditorSeam): string?
+		return Seam.orientationFault(
+			{ id = seam.label, point = seam.node, surface = "" },
+			{ id = seam.label, point = seam.partner, surface = "" }
+		)
+	end
+
 	--[[ Put this seam's node on the ray from the eye through its partner, keeping its own distance
 	     from the eye, so the two are drawn on the same pixel. This only ever moves the piece
 	     ACROSS the eye ray -- depth is untouched -- which is precisely why it composes with the
 	     depth pins instead of fighting them. ]]
-	local function solveSeamRaw(target: Target, seam: EditorSeam): boolean
-		local eye = cam:GetRenderCFrame().Position
-		local toPartner = seam.partner.WorldPosition - eye
+	local function solveSeamFrom(target: Target, eye: Vector3, nodePos: Vector3, partnerPos: Vector3): boolean
+		local toPartner = partnerPos - eye
 		if toPartner.Magnitude < 1e-3 then
 			return false
 		end
-		local reach = (seam.node.WorldPosition - eye).Magnitude
-		applyDelta(target, (eye + toPartner.Unit * reach) - seam.node.WorldPosition)
+		local reach = (nodePos - eye).Magnitude
+		applyDelta(target, (eye + toPartner.Unit * reach) - nodePos)
 		return true
 	end
 
@@ -843,12 +909,20 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			return
 		end
 		applyDelta(target, delta)
-		--[[ A hand nudge is the author overruling the solver, so the join this piece was holding
-		     is released rather than snapped straight back on the next sweep. ENTER re-locks it. ]]
-		local seam = target.seams[1]
-		if seam and locked[seam.label] then
-			locked[seam.label] = nil
-			say("moved by hand -- join released, ENTER re-locks it", true)
+		--[[ A hand nudge is the author overruling the solver, so EVERY join this piece holds is
+		     released rather than snapped straight back on the next sweep -- a surface appears
+		     once per seam it carries, and releasing only the selected entry's let the surviving
+		     lock re-drag the piece mid-nudge. ENTER re-locks. ]]
+		local releasedAny = false
+		for _, t in targets do
+			local tSeam = t.seams[1]
+			if t.model == target.model and tSeam and locked[tSeam.label] then
+				locked[tSeam.label] = nil
+				releasedAny = true
+			end
+		end
+		if releasedAny then
+			say("moved by hand -- joins released, ENTER re-locks", true)
 		end
 		if runSolver then
 			runSolver()
@@ -879,6 +953,22 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		else
 			options.onChanged()
 		end
+		--[[ A tilt rotates the whole MODEL, and past Seam's opposition tolerance a pair is
+		     disqualified AT EVERY ANGLE even though it still lines up on screen. The old failure
+		     was silent: the editor read 0 px while the game said "nothing coincides from here".
+		     Every seam the model carries is checked -- a piece with two joins degrades them at
+		     different rates under the same tilt, and the selected entry's can survive a press
+		     that kills the other. ]]
+		local faulted: string? = nil
+		for _, t in targets do
+			local tSeam = t.seams[1]
+			if t.model == target.model and tSeam and seamOrientationFault(tSeam) then
+				faulted = t.joinsTo
+			end
+		end
+		if faulted then
+			say(`TILTED TOO FAR -- the join to {faulted} cannot connect any more (BACKSPACE)`, false)
+		end
 		refresh()
 	end
 
@@ -905,9 +995,23 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			refresh()
 			return
 		end
-		--[[ Declaring the join, not performing it once. The sweep holds it from here on, so later
-		     work on other pieces cannot quietly pull this one apart again. ]]
-		locked[seam.label] = true
+		if seamOrientationFault(seam) then
+			-- Lining the pixels up would succeed and the seam would STILL never arm.
+			say("cannot join: the faces no longer oppose (tilted too far -- BACKSPACE puts it back)", false)
+			return
+		end
+		--[[ Declaring the join, not performing it once. The sweep holds it from here on -- FROM
+		     THIS VIEW -- so later work on other pieces, composed from other views, cannot pull
+		     this one apart again. ]]
+		local partnerModel = seam.partner:FindFirstAncestorOfClass("Model")
+		locked[seam.label] = {
+			eye = cam:GetRenderCFrame().Position,
+			nodeBase = seam.node.WorldPosition,
+			nodeMovedBase = moved[target.model] or Vector3.zero,
+			partnerBase = seam.partner.WorldPosition,
+			partnerModel = partnerModel,
+			partnerMovedBase = if partnerModel then (moved[partnerModel] or Vector3.zero) else Vector3.zero,
+		}
 		local ok: boolean = true
 		local why: string? = nil
 		if runSolver then
@@ -934,9 +1038,15 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			say(`cannot flip: {blockedBy}`, false)
 			return
 		end
-		local eye = cam:GetRenderCFrame().Position
-		local toNode = seam.node.WorldPosition - eye
-		local mine, theirs = depths(seam)
+		--[[ Mirror about the seam's OWN view when it is locked: the flip then keeps the node on
+		     the lock's ray and the join survives it exactly, as the sweep expects. ]]
+		local lock = locked[seam.label]
+		local eye = if lock then lock.eye else cam:GetRenderCFrame().Position
+		local partnerPos = if lock then lockPartnerPos(lock) else seam.partner.WorldPosition
+		local nodePos = if lock then lockNodePos(lock, target) else seam.node.WorldPosition
+		local toNode = nodePos - eye
+		local mine = toNode.Magnitude
+		local theirs = (partnerPos - eye).Magnitude
 		if toNode.Magnitude < 1e-3 or theirs < 1e-3 then
 			return
 		end
@@ -952,7 +1062,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		     eye ray, so a joined node stays on the eye-to-partner ray and the join is preserved
 		     exactly -- going via moveBy released it, which is the one thing a flip does not do. ]]
 		local wanted = eye + toNode.Unit * wantedDistance
-		applyDelta(target, wanted - seam.node.WorldPosition)
+		-- The delta is computed in the same frame the mirror was: authored positions for a locked
+		-- seam, live for a free one. Mixing them dragged a locked rotor by its swing.
+		applyDelta(target, wanted - nodePos)
 		if runSolver then
 			runSolver()
 		else
@@ -982,7 +1094,21 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not list or #list == 0 then
 			return true, nil
 		end
-		local dir = slideAxis(target)
+		--[[ A LOCKED piece must slide along its lock's stored ray, not the live eye ray. Sliding
+		     along the stored ray keeps the node on it -- the join survives EXACTLY -- while still
+		     changing depth at the overlaps; sliding along the live ray (composed from another
+		     view, the rays can be near-perpendicular) knocked the node off the stored ray, the
+		     lock pass dragged it back, and the two passes fought to a draw: the pin landed studs
+		     short of what it reported. ]]
+		local seam = target.seams[1]
+		local lock = if seam then locked[seam.label] else nil
+		local dir: Vector3
+		if seam and lock then
+			local along = lockNodePos(lock, target) - lock.eye
+			dir = if along.Magnitude > 1e-3 then along.Unit else slideAxis(target)
+		else
+			dir = slideAxis(target)
+		end
 		local lowest, highest = -math.huge, math.huge
 		local blocked: string? = nil
 		local dropped: { string } = {}
@@ -997,7 +1123,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				continue
 			end
 			local k = dir:Dot(rayDir)
-			if math.abs(k) < 1e-3 then
+			--[[ 0.05, not epsilon: a locked piece slides along its lock's ray, which can sit near
+			     ninety degrees to this overlap's live ray -- k then shrinks toward sin^2(pitch)
+			     and the division below would amplify a sub-stud depth need into a slide of tens of
+			     studs. Refusing with the existing message beats teleporting the piece. ]]
+			if math.abs(k) < 0.05 then
 				blocked = `moving {target.id} does not change its depth against {pin.other.name} from here`
 				break
 			end
@@ -1032,6 +1162,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			return false, blocked
 		end
 		local t = math.clamp(0, lowest, highest)
+		if math.abs(t) > 25 then
+			-- A rule that wants the piece moved this far is geometry fighting the view, not an
+			-- ordering nudge; name it rather than fling the piece off screen.
+			conflicts[target.model] = clash
+			return false, `satisfying this rule would slide {target.id} {("%.0f"):format(math.abs(t))} studs -- refusing`
+		end
 		if math.abs(t) > 1e-4 then
 			applyDelta(target, dir * t)
 		end
@@ -1071,8 +1207,13 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		for _ = 1, 4 do
 			for _, target in targets do
 				local seam = target.seams[1]
-				if seam and locked[seam.label] then
-					solveSeamRaw(target, seam)
+				local lock = if seam then locked[seam.label] else nil
+				if seam and lock then
+					--[[ From the lock's own stored eye, against where the partner was at compose
+					     time plus whatever the AUTHOR has moved it since. The live camera and the
+					     rotor's live swing play no part -- this is what lets two seams composed
+					     from different views coexist. ]]
+					solveSeamFrom(target, lock.eye, lockNodePos(lock, target), lockPartnerPos(lock))
 				end
 			end
 			problem = nil
@@ -1158,9 +1299,13 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 
 		-- Release what was declared first, or the sweep re-establishes it and undo looks inert.
-		local seam = target.seams[1]
-		if seam then
-			locked[seam.label] = nil
+		-- EVERY join this piece carries: a surface appears once per seam (demo 3's high walkway
+		-- holds two), and releasing only the selected entry's let the sweep re-drag the piece.
+		for _, t in targets do
+			local tSeam = t.seams[1]
+			if t.model == target.model and tSeam then
+				locked[tSeam.label] = nil
+			end
 		end
 		target.model:SetAttribute(ATTR_FRONT, "")
 		target.model:SetAttribute(ATTR_BACK, "")
@@ -1262,7 +1407,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				flipDepth()
 			elseif code == Enum.KeyCode.C then
 				composeCF = cam:GetRenderCFrame()
-				say("composing from here now -- earlier rules were solved for the old view", true)
+				say("composing from here now -- earlier joins keep the views they were made from", true)
 				refresh()
 			elseif code == Enum.KeyCode.G then
 				tiltBy(-math.rad(TILT_STEPS[stepIndex]))
@@ -1320,8 +1465,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local handle: Handle = {
 		toggle = function()
 			open = not open
-			if open then
-				-- Whatever is on screen when the tool opens is what the shot is being framed from.
+			if open and not hasWork() then
+				--[[ Whatever is on screen when the tool opens is what the shot is being framed
+				     from -- but ONLY while nothing has been declared yet. Recapturing over
+				     existing work silently rebased every pin onto whatever angle the author
+				     happened to reopen at; C stays the one explicit way to re-compose. ]]
 				composeCF = cam:GetRenderCFrame()
 			end
 			gui.Enabled = open
@@ -1339,6 +1487,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 					options.onClose()
 				end
 			end
+		end,
+
+		hasTiltWork = function(): boolean
+			return next(tilted) ~= nil
 		end,
 
 		isOpen = function(): boolean
