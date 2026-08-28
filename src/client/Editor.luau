@@ -244,7 +244,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	help.Size = UDim2.fromOffset(470, 60)
 	help.TextYAlignment = Enum.TextYAlignment.Top
 	help.Text = table.concat({
-		"ORDER  1-9  cycle a piece        \\  clear this piece        G / H  TILT this piece",
+		"ORDER  1-9  cycle a piece     \\  clear this piece     G / H  TILT     C  compose from here",
 		"JOIN   ENTER  join these ends and KEEP them joined     Z  swap which side is in front",
 		"MOVE   arrows  across the screen    K / I  depth    -  =  step    [ ]  another piece",
 		"       BACKSPACE  undo this piece       P  print the numbers to paste back",
@@ -330,6 +330,51 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		directly, with the game stopped, saving into the place file. So this is already the Studio
 		integration -- the in-game panel is a convenience over it, not the only way in.
 	]]
+	--[[
+		THE COMPOSITION VIEWPOINT -- and why editing is refused without it.
+
+		An alignment means nothing except from the angle it was composed at, and EVERY measurement
+		this tool makes is taken from the camera: which pieces overlap, which is in front, which way
+		a piece must slide to change that. So if the author orbits away to inspect and then edits,
+		the solver dutifully re-establishes every rule FOR THE ANGLE THEY DRIFTED TO and drags the
+		geometry somewhere that means nothing from where the shot is actually framed.
+
+		That is not a subtle effect. Demo 3 orbits freely, and a rule re-solved from ninety degrees
+		away moves a piece along a completely different eye ray -- which reads, correctly, as "the
+		platforms physically moved quite a lot".
+
+		So the viewpoint is captured when the editor opens, every path that can move geometry is
+		refused while the live camera has drifted from it, and C re-captures it when the author
+		genuinely means to compose from somewhere else.
+	]]
+	local composeCF: CFrame? = nil
+	local COMPOSE_DOT = math.cos(math.rad(0.5))
+
+	local function atComposeView(): boolean
+		local held = composeCF
+		if not held then
+			return true
+		end
+		local live = cam:GetRenderCFrame()
+		if (live.Position - held.Position).Magnitude > 1 then
+			return false
+		end
+		return live.LookVector:Dot(held.LookVector) >= COMPOSE_DOT
+	end
+
+	--[[ One answer for every path that moves geometry, so a new one cannot be added without a
+	     gate by accident -- which is exactly how moveBy and the tilt keys came to be ungated. ]]
+	local function canEdit(): (boolean, string?)
+		if not atComposeView() then
+			return false, "orbited away from the composition view -- orbit back, or C composes from here"
+		end
+		local gate = options.canSolve
+		if gate and not gate() then
+			return false, "the view is not settled"
+		end
+		return true, nil
+	end
+
 	--[[ The amber marker has no cursor to follow any more, so it sits on whatever the author
 	     last changed -- which is the piece they are thinking about. ]]
 	local lastTouched: Instance? = nil
@@ -701,6 +746,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			return
 		end
 
+		--[[ The loudest thing on the panel when it applies: every reading below is taken from the
+		     live camera, so once the author has orbited none of it describes the shot. ]]
+		title.Text = if atComposeView()
+			then "MAP EDITOR                                        M closes"
+			else "MAP EDITOR   -- ORBITED AWAY, EDITS PAUSED --   C composes from here"
+
 		parkMarker(selectedMarker, target.model)
 		-- Scanned once per frame and shared with refreshStack below; it is the costly part here.
 		local rows = rowsFor(target)
@@ -763,6 +814,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target then
 			return
 		end
+		local editable, blockedBy = canEdit()
+		if not editable then
+			say(`cannot move: {blockedBy}`, false)
+			return
+		end
 		applyDelta(target, delta)
 		--[[ A hand nudge is the author overruling the solver, so the join this piece was holding
 		     is released rather than snapped straight back on the next sweep. ENTER re-locks it. ]]
@@ -784,6 +840,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local function tiltBy(radians: number)
 		local target = current()
 		if not target then
+			return
+		end
+		local editable, blockedBy = canEdit()
+		if not editable then
+			say(`cannot tilt: {blockedBy}`, false)
 			return
 		end
 		if not applyTilt(target, radians) then
@@ -810,9 +871,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target or not seam then
 			return
 		end
-		local gate = options.canSolve
-		if gate and not gate() then
-			say("cannot solve from here -- the view is not settled", false)
+		local editable, blockedBy = canEdit()
+		if not editable then
+			say(`cannot join: {blockedBy}`, false)
 			return
 		end
 		if locked[seam.label] then
@@ -845,9 +906,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target or not seam then
 			return
 		end
-		local gate = options.canSolve
-		if gate and not gate() then
-			say("cannot flip from here -- the view is not settled", false)
+		local editable, blockedBy = canEdit()
+		if not editable then
+			say(`cannot flip: {blockedBy}`, false)
 			return
 		end
 		local eye = cam:GetRenderCFrame().Position
@@ -968,6 +1029,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		something the author has not pinned needs to move.
 	]]
 	local function reconcile(): (boolean, string?)
+		--[[ The one place geometry actually moves, so it is guarded here as well as at every entry
+		     point above: an attribute edited from Studio reaches this without passing any of them. ]]
+		local editable, blockedBy = canEdit()
+		if not editable then
+			return false, blockedBy
+		end
 		local problem: string? = nil
 		for _ = 1, 4 do
 			for _, target in targets do
@@ -997,9 +1064,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not target then
 			return
 		end
-		local gate = options.canSolve
-		if gate and not gate() then
-			say("cannot reorder from here -- the view is not settled", false)
+		local editable, blockedBy = canEdit()
+		if not editable then
+			say(`cannot reorder: {blockedBy}`, false)
 			return
 		end
 		local rows = rowsFor(target)
@@ -1140,6 +1207,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				solve()
 			elseif code == Enum.KeyCode.Z then
 				flipDepth()
+			elseif code == Enum.KeyCode.C then
+				composeCF = cam:GetRenderCFrame()
+				say("composing from here now -- earlier rules were solved for the old view", true)
+				refresh()
 			elseif code == Enum.KeyCode.G then
 				tiltBy(-math.rad(TILT_STEPS[stepIndex]))
 			elseif code == Enum.KeyCode.H then
@@ -1196,6 +1267,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local handle: Handle = {
 		toggle = function()
 			open = not open
+			if open then
+				-- Whatever is on screen when the tool opens is what the shot is being framed from.
+				composeCF = cam:GetRenderCFrame()
+			end
 			gui.Enabled = open
 			if open then
 				if options.onOpen then
