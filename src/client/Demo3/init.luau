@@ -347,6 +347,50 @@ function Demo3.start(ctx: Shell.Context): boolean
 		end
 		hud.exitButton.Activated:Connect(doExit)
 
+		--[[
+			SNAP ON SETTLE — what makes the crossing actually seamless.
+
+			A weave is legal anywhere inside epsilonDeg (0.13 deg = 23 px at 1080p), and the
+			crossing teleports the avatar by exactly the node-to-partner delta -- so every pixel
+			of legal residual became a visible sideways JUMP at the moment of crossing. Monument
+			Valley's answer: recalculate only at snap positions, and make the snap exact. When
+			the camera settles and a seam is within epsilon, the surface the player is NOT
+			standing on is nudged the last fraction of a stud so the two nodes sit on the same
+			eye ray EXACTLY -- at most ~1 stud, imperceptible from the composed angle because the
+			move is across the residual only. Undone the moment the settle breaks, so orbiting
+			shows the honest geometry and the editor never sees a snapped world.
+		]]
+		local snapped: { [Model]: Vector3 } = {}
+		local standingOn: (model: Model) -> boolean
+		local function revertSnaps()
+			for model, delta in snapped do
+				--[[ Carry the player with the floor. A successful crossing always LANDS on the
+				     snapped surface (the snap deliberately moves the side the player is not on),
+				     so the settle-breaking orbit that follows every crossing used to slide the
+				     ground out from under them by up to a stud. Same rule as the snap itself,
+				     applied in reverse. ]]
+				if standingOn(model) then
+					local character = ctx.player.Character
+					if character then
+						character:PivotTo(character:GetPivot() - delta)
+					end
+				end
+				model:PivotTo(model:GetPivot() - delta)
+			end
+			table.clear(snapped)
+		end
+
+		function standingOn(model: Model): boolean
+			local character = ctx.player.Character
+			local root = if character then character:FindFirstChild("HumanoidRootPart") else nil
+			if not root or not root:IsA("BasePart") then
+				return false
+			end
+			local cf, size = model:GetBoundingBox()
+			local p = cf:PointToObjectSpace(root.Position)
+			return math.abs(p.X) <= size.X / 2 + 3 and math.abs(p.Z) <= size.Z / 2 + 3 and p.Y >= 0 and p.Y <= size.Y / 2 + 8
+		end
+
 		local function unsettle()
 			if not settled then
 				return
@@ -355,6 +399,8 @@ function Demo3.start(ctx: Shell.Context): boolean
 			liveEdges = 0
 			table.clear(liveBars)
 			traverser.setGraph(nil, nil)
+			-- The snap only ever exists inside a settle: orbiting away shows honest geometry.
+			revertSnaps()
 			if not solved then
 				hud.setState("")
 				--[[ Until the first drag this is the intro line, M mention included: R triggers
@@ -372,7 +418,36 @@ function Demo3.start(ctx: Shell.Context): boolean
 			settled = true
 			stillFor = 0
 			settleYaw, settlePitch = orbit.get()
+			-- Measure the honest geometry: a re-settle (editor onChanged) must not snap on top
+			-- of a previous snap.
+			revertSnaps()
 			local graph = Seam.build(nodes, cam:GetRenderCFrame(), seamOptions)
+			if not editing then
+				local eye = cam:GetRenderCFrame().Position
+				for _, edge in graph.edges do
+					local na, nb = nodes[edge.a], nodes[edge.b]
+					local ma, mb = building.models[na.surface], building.models[nb.surface]
+					-- The ground under the player's feet must not shift: move the other side.
+					local movePoint, fixedPoint, moveModel = na.point, nb.point, ma
+					if standingOn(ma) then
+						movePoint, fixedPoint, moveModel = nb.point, na.point, mb
+					end
+					local toFixed = fixedPoint.WorldPosition - eye
+					if toFixed.Magnitude > 1e-3 then
+						local wanted = eye + toFixed.Unit * (movePoint.WorldPosition - eye).Magnitude
+						local delta = wanted - movePoint.WorldPosition
+						--[[ The legal residual is ANGULAR, so its stud size scales with distance:
+						     epsilon at this range, plus a quarter of slack. A fixed cap silently
+						     stopped snapping on portrait viewports, where the fitted standoff
+						     grows and a legal residual can exceed 1.4 studs. ]]
+						local maxSnap = toFixed.Magnitude * math.tan(math.rad(TUNE.epsilonDeg)) * 1.25
+						if delta.Magnitude > 1e-4 and delta.Magnitude <= maxSnap then
+							moveModel:PivotTo(moveModel:GetPivot() + delta)
+							snapped[moveModel] = (snapped[moveModel] or Vector3.zero) + delta
+						end
+					end
+				end
+			end
 			-- Handing the character in disarms any node whose mouth already contains it, which is
 			-- the fix for the case that would otherwise read as a bug: settling while standing ON
 			-- a seam that goes live. It is per-node and self-releasing, so unlike a blanket timer
@@ -605,6 +680,8 @@ function Demo3.start(ctx: Shell.Context): boolean
 			onOpen = function()
 				editing = true
 				traverser.setGraph(nil, nil)
+				-- The author edits the real map, never the snapped one.
+				revertSnaps()
 				freezeAvatar()
 			end,
 			onClose = function()

@@ -175,6 +175,29 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	--[[ The pose a piece held before the author first touched it. Undo restores this directly:
 	     translating by -offset cannot take a TILT back, so undo used to leave a piece rotated. ]]
 	local homeCF: { [PVInstance]: CFrame } = {}
+	--[[ Notes from the last sweep worth saying out loud -- currently: which pieces a shortfall
+	     was delegated to. Success with a side effect, not a failure. Deduplicated: the sweep runs
+	     four rounds and a repeating delegation must not stack four copies of itself. ]]
+	local sweepNotes: { string } = {}
+	local function note(text: string)
+		if not table.find(sweepNotes, text) then
+			table.insert(sweepNotes, text)
+		end
+	end
+	--[[ |u| of each pin's last delegation THIS reconcile. A re-firing whose ask has not shrunk is
+	     ping-pong -- the other piece's own rules pushed it straight back -- and firing again would
+	     move geometry every round while reporting nothing. ]]
+	local delegateHistory: { [Pin]: number } = {}
+	--[[ What the status line should append when the sweep moved a piece the author did not
+	     select. Every reconcile caller surfaces this; silence was how a stale note ended up
+	     voiced against the WRONG action. ]]
+	local function notesSuffix(): string
+		if #sweepNotes == 0 then
+			return ""
+		end
+		local extra = if #sweepNotes > 1 then ` (+{#sweepNotes - 1} more)` else ""
+		return ` -- {sweepNotes[1]}{extra}`
+	end
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "MapEditor"
@@ -921,13 +944,17 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				releasedAny = true
 			end
 		end
-		if releasedAny then
-			say("moved by hand -- joins released, ENTER re-locks", true)
-		end
 		if runSolver then
 			runSolver()
 		else
 			options.onChanged()
+		end
+		--[[ Voiced AFTER the sweep, so the note describes THIS action -- read before it, the line
+		     always narrated the previous keypress's delegation and swallowed this one's. ]]
+		if releasedAny then
+			say(`moved by hand -- joins released, ENTER re-locks{notesSuffix()}`, true)
+		elseif #sweepNotes > 0 then
+			say(sweepNotes[1], true)
 		end
 		refresh()
 	end
@@ -968,6 +995,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		if faulted then
 			say(`TILTED TOO FAR -- the join to {faulted} cannot connect any more (BACKSPACE)`, false)
+		elseif #sweepNotes > 0 then
+			say(sweepNotes[1], true)
 		end
 		refresh()
 	end
@@ -1017,7 +1046,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if runSolver then
 			ok, why = runSolver()
 		end
-		say(if ok then `joined to {target.joinsTo} -- it will stay joined` else `joined, but: {why}`, ok)
+		say(
+			if ok
+				then `joined to {target.joinsTo} -- it will stay joined{notesSuffix()}`
+				else `joined, but: {why}{notesSuffix()}`,
+			ok
+		)
 		refresh()
 	end
 
@@ -1067,8 +1101,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		applyDelta(target, wanted - nodePos)
 		if runSolver then
 			runSolver()
-		else
-			options.onChanged()
+		end
+		if #sweepNotes > 0 then
+			say(sweepNotes[1], true)
 		end
 		refresh()
 	end
@@ -1088,7 +1123,39 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	]]
 	local MARGIN = 0.5
 
-	local function applyOne(target: Target): (boolean, string?)
+	--[[ The lock-aware slide axis, shared by applyOne for the pinned piece AND for a piece a
+	     shortfall gets delegated to. Along the lock's stored ray when locked (the join survives
+	     the slide exactly), the live eye ray otherwise. ]]
+	local function slideAxisFor(target: Target): Vector3
+		local seam = target.seams[1]
+		local lock = if seam then locked[seam.label] else nil
+		if seam and lock then
+			local along = lockNodePos(lock, target) - lock.eye
+			if along.Magnitude > 1e-3 then
+				return along.Unit
+			end
+		end
+		return slideAxis(target)
+	end
+
+	local function targetFor(inst: Instance): Target?
+		--[[ A model can appear as several entries (one per seam it carries), and their slide axes
+		     differ once one is locked: prefer the LOCKED entry, so a delegated slide runs along
+		     the ray that keeps its join -- the first-listed entry is otherwise arbitrary. ]]
+		local fallback: Target? = nil
+		for _, t in targets do
+			if t.model == inst then
+				local tSeam = t.seams[1]
+				if tSeam and locked[tSeam.label] then
+					return t
+				end
+				fallback = fallback or t
+			end
+		end
+		return fallback
+	end
+
+	local function applyOne(target: Target, allowDelegate: boolean): (boolean, string?)
 		local list = pins[target.model]
 		conflicts[target.model] = nil
 		if not list or #list == 0 then
@@ -1100,15 +1167,21 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		     view, the rays can be near-perpendicular) knocked the node off the stored ray, the
 		     lock pass dragged it back, and the two passes fought to a draw: the pin landed studs
 		     short of what it reported. ]]
-		local seam = target.seams[1]
-		local lock = if seam then locked[seam.label] else nil
-		local dir: Vector3
-		if seam and lock then
-			local along = lockNodePos(lock, target) - lock.eye
-			dir = if along.Magnitude > 1e-3 then along.Unit else slideAxis(target)
-		else
-			dir = slideAxis(target)
+		--[[ A piece pinned both IN FRONT OF and BEHIND the same reference is a contradiction, not
+		     a solve: hand-typed attributes make it easy to write, and feeding it to the delegation
+		     below marched both pieces toward the camera a few studs per keypress, forever, while
+		     reporting success. Refuse by name instead. ]]
+		local wantFront: { [Instance]: boolean } = {}
+		for _, pin in list do
+			local seen = wantFront[pin.other.instance]
+			if seen ~= nil and seen ~= pin.inFront then
+				conflicts[target.model] = { [pin.other.instance] = true }
+				return false, `{target.id} is pinned both in front of and behind {pin.other.name} -- remove one`
+			end
+			wantFront[pin.other.instance] = pin.inFront
 		end
+
+		local dir = slideAxisFor(target)
 		local lowest, highest = -math.huge, math.huge
 		local blocked: string? = nil
 		local dropped: { string } = {}
@@ -1144,15 +1217,55 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				lo = math.max(lowest, limit)
 			end
 			if lo > hi then
-				--[[ How far the rules are from co-existing, in studs of DEPTH SPREAD across this
-				     piece. A slide cannot supply that -- it moves the whole piece equally -- so the
-				     number is quoted next to the keys that can. ]]
-				short = math.max(short, lo - hi)
-				table.insert(
-					dropped,
-					if pin.inFront then `in front of {pin.other.name}` else `behind {pin.other.name}`
-				)
-				clash[pin.other.instance] = true
+				--[[ Sliding THIS piece cannot satisfy the set -- but the ordering is a statement
+				     about a PAIR, and the other piece can usually supply what this one cannot.
+				     The user's own case: "high walkway behind the start walkway, in front of its
+				     pole" needs +20 studs of depth with only +6 of headroom, and no tilt of the
+				     walkway can close it (its two overlap regions sit 5 studs apart -- the tilt
+				     would need 175 degrees). Sliding the START walkway 14 studs toward the camera
+				     solves it exactly, invisibly from this view. So the shortfall is DELEGATED:
+				     this piece takes its headroom, the other piece slides the remainder along its
+				     own (lock-aware) axis. The next sweep round re-measures honestly. ]]
+				local delegated = false
+				local other = if allowDelegate then targetFor(pin.other.instance) else nil
+				if other and other ~= target then
+					local axisO = slideAxisFor(other)
+					local kO = axisO:Dot(rayDir)
+					local boundary = if (pin.inFront and k > 0) or (not pin.inFront and k < 0)
+						then lowest -- this pin wanted the ceiling; the floor is what stands
+						else highest
+					if math.abs(kO) >= 0.05 and math.abs(boundary) ~= math.huge then
+						-- Move `theirs` so this pin's limit lands exactly on the boundary.
+						local u = (k * (boundary - limit)) / kO
+						--[[ Only while the ask is SHRINKING. The other piece's own rules run after
+						     this and can slide it straight back; re-firing at full size every round
+						     is that fight, not progress, and the verification pass below will name
+						     the loser honestly. ]]
+						local prev = delegateHistory[pin]
+						local converging = prev == nil or math.abs(u) < prev * 0.75
+						if math.abs(u) <= 25 and converging then
+							delegateHistory[pin] = math.abs(u)
+							applyDelta(other, axisO * u)
+							if (pin.inFront and k > 0) or (not pin.inFront and k < 0) then
+								highest = math.min(highest, boundary)
+							else
+								lowest = math.max(lowest, boundary)
+							end
+							note(
+								`moved {other.id} {("%.1f"):format(math.abs(u))} studs to put {target.id} {if pin.inFront then "in front of" else "behind"} it`
+							)
+							delegated = true
+						end
+					end
+				end
+				if not delegated then
+					short = math.max(short, lo - hi)
+					table.insert(
+						dropped,
+						if pin.inFront then `in front of {pin.other.name}` else `behind {pin.other.name}`
+					)
+					clash[pin.other.instance] = true
+				end
 			else
 				lowest, highest = lo, hi
 			end
@@ -1176,8 +1289,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			--[[ Naming the way out, not just the refusal. Sliding cannot reconcile these; turning
 			     the piece can, because that is what changes its depth from one overlap to the
 			     next. See applyTilt. ]]
+			--[[ No more "tilt to make room" as a blanket promise -- in the case that prompted all
+			     this, the tilt needed was 175 degrees. If delegation could not do it either, the
+			     honest answer is that this arrangement is not reachable from here. ]]
 			return false,
-				`{target.id} cannot also be {table.concat(dropped, " and ")} -- {("%.1f"):format(short)} studs short. G / H tilt to make room.`
+				`{target.id} cannot be {table.concat(dropped, " and ")} from this angle -- {("%.1f"):format(short)} studs short, even moving the other piece`
 		end
 		return true, nil
 	end
@@ -1203,6 +1319,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not editable then
 			return false, blockedBy
 		end
+		table.clear(sweepNotes)
+		table.clear(delegateHistory)
 		local problem: string? = nil
 		for _ = 1, 4 do
 			for _, target in targets do
@@ -1216,12 +1334,21 @@ function Editor.new(targets: { Target }, options: Options): Handle
 					solveSeamFrom(target, lock.eye, lockNodePos(lock, target), lockPartnerPos(lock))
 				end
 			end
-			problem = nil
 			for _, target in targets do
-				local ok, why = applyOne(target)
-				if not ok then
-					problem = why
-				end
+				applyOne(target, true)
+			end
+		end
+		--[[ THE VERIFICATION PASS decides what is true. A delegated move can be reverted by the
+		     other piece's own rules later in the same round, and a round-4 delegation was never
+		     re-measured at all -- so the sweep used to report success on arrangements it had not
+		     achieved, with the row reading NOT YET under a status line saying it worked. This
+		     pass folds every interval honestly, with delegation off: whatever cannot stand is
+		     dropped, marked on its row, and named in the return. ]]
+		problem = nil
+		for _, target in targets do
+			local ok, why = applyOne(target, false)
+			if not ok then
+				problem = why
 			end
 		end
 		options.onChanged()
@@ -1274,7 +1401,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			then `in front of {row.ref.name}`
 			elseif nextState == "back" then `behind {row.ref.name}`
 			else `no longer ordered against {row.ref.name}`
-		say(if ok then `{target.id} is {said}` else `{why}`, ok)
+		-- The solver moving a piece the author did not select is never silent -- on failure too.
+		say(if ok then `{target.id} is {said}{notesSuffix()}` else `{why}{notesSuffix()}`, ok)
 		refresh()
 	end
 
@@ -1323,7 +1451,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		homeCF[target.model] = nil
 
 		reconcile()
-		say(`{target.id} put back -- its join and rules were released`, true)
+		say(`{target.id} put back -- its join and rules were released{notesSuffix()}`, true)
 		refresh()
 	end
 
@@ -1436,7 +1564,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 					target.model:SetAttribute(ATTR_BACK, "")
 					syncPins()
 					reconcile()
-					say(`cleared every rule on {target.id}`, true)
+					say(`cleared every rule on {target.id}{notesSuffix()}`, true)
 					refresh()
 				end
 			elseif code == Enum.KeyCode.Backspace then
@@ -1467,6 +1595,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 						syncPins()
 						if open then
 							reconcile()
+							if #sweepNotes > 0 then
+								-- A Studio-typed rule can delegate too; that move is never silent.
+								say(sweepNotes[1], true)
+							end
 							refresh()
 						end
 					end)
