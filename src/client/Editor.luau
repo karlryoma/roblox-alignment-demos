@@ -69,6 +69,7 @@
 	Output; the numbers go back into the level file, which is what Rojo syncs.
 ]]
 
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
@@ -587,7 +588,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		visible. Returns nil when they do not overlap in frame -- they cannot occlude each other
 		there, so there is nothing to order.
 	]]
-	local function overlapDepths(a: Instance, b: Instance): (number?, number?, Vector3?)
+	local function overlapDepths(a: Instance, b: Instance, wantAInFront: boolean?): (number?, number?, Vector3?)
 		local aLo, aHi, aOk = screenBox(a)
 		local bLo, bHi, bOk = screenBox(b)
 		if not aOk or not bOk then
@@ -605,11 +606,25 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			the one nearest the centre wins. Testing only the centre made the tool report "these do
 			not overlap" for exactly the crossings a Penrose figure is made of.
 		]]
-		local best: (Vector2?) = nil
-		local bestDistance = math.huge
+		--[[ WHICH ray of the overlap to measure is a semantic choice, and it took three tries:
+		     nearest-to-centre sampled the knife edge where a seam pair's depths converge (panel
+		     and solver could sample different rays and contradict each other), and max-|diff|
+		     flipped between OPPOSITE-sign extremes under a hundredth of a degree of camera drift
+		     -- the same keypress slid a piece six studs or did nothing depending on invisible
+		     camera phase -- while a declaration the dominant end already satisfied hid every
+		     violation on the minority side, by construction.
+
+		     So the caller states a direction. For a declared rule, measure the ray that most
+		     VIOLATES it (max signed da-db for "a in front", the mirror for "behind"): a slide
+		     shifts every ray's depth equally, so satisfying the rule at its worst ray satisfies
+		     it at every sampled ray -- the invariant max-|diff| only pretended to have. Display
+		     of a declared rule reads the same worst ray, so the row and the solver cannot
+		     disagree; and a directional extreme never flips ends, only jitters locally. With no
+		     direction (undeclared rows) the dominant order is informational: max |diff|. ]]
+		local found = false
+		local bestScore = -math.huge
 		local bestA, bestB = 0, 0
 		local bestDir = Vector3.zAxis
-		local centre = (lo + hi) * 0.5
 		local GRID = 6
 		for ix = 0, GRID do
 			for iy = 0, GRID do
@@ -621,16 +636,19 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				local da = rayEntry(a, ray.Origin, ray.Direction)
 				local db = rayEntry(b, ray.Origin, ray.Direction)
 				if da and db then
-					local distance = (at - centre).Magnitude
-					if distance < bestDistance then
-						best, bestDistance = at, distance
+					local score = if wantAInFront == nil
+						then math.abs(da - db)
+						elseif wantAInFront then da - db
+						else db - da
+					if score > bestScore then
+						found, bestScore = true, score
 						bestA, bestB = da, db
 						bestDir = ray.Direction.Unit
 					end
 				end
 			end
 		end
-		if not best then
+		if not found then
 			return nil, nil, nil
 		end
 		return bestA, bestB, bestDir
@@ -669,6 +687,31 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return (seam.node.WorldPosition - eye).Magnitude, (seam.partner.WorldPosition - eye).Magnitude
 	end
 
+	--[[ Whether the local player's avatar is standing on this piece: same bounding-box test the
+	     demos use. The editor moves geometry by teleporting it, and the avatar does not come
+	     along for free -- the solver once slid the start walkway 16 studs and left the author's
+	     frozen avatar hanging in the air, to drop onto the pole below mid-composition. ]]
+	local function playerStandsOn(inst: PVInstance): boolean
+		local character = Players.LocalPlayer.Character
+		local root = if character then character:FindFirstChild("HumanoidRootPart") else nil
+		if not root or not root:IsA("BasePart") then
+			return false
+		end
+		--[[ A raycast straight down, not a bounding-box test: the demos stack pieces (a pole's
+		     top sits one stud under the walkway's deck), and a box-with-margins test called the
+		     avatar "standing on" the pole below the walkway it was really on -- so a sweep moving
+		     the pole dragged an avatar that was not on it. What the first ray down hits IS the
+		     floor underfoot, ambiguity-free. ]]
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { character :: Instance }
+		local hit = workspace:Raycast(root.Position, Vector3.new(0, -10, 0), params)
+		if not hit then
+			return false
+		end
+		return hit.Instance == inst or hit.Instance:IsDescendantOf(inst)
+	end
+
 	--[[ Move a target without triggering a sweep: the primitive every automatic pass is built
 	     from. moveBy is the authored version and reconciles afterwards. ]]
 	local function applyDelta(target: Target, delta: Vector3)
@@ -678,11 +721,19 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not homeCF[target.model] then
 			homeCF[target.model] = target.model:GetPivot()
 		end
+		-- Checked BEFORE the piece moves, or the box has already left the avatar behind.
+		local carry = playerStandsOn(target.model)
 		local apply = target.apply
 		if apply then
 			apply(delta)
 		else
 			target.model:PivotTo(target.model:GetPivot() + delta)
+		end
+		if carry then
+			local character = Players.LocalPlayer.Character
+			if character then
+				character:PivotTo(character:GetPivot() + delta)
+			end
 		end
 		moved[target.model] = (moved[target.model] or Vector3.zero) + delta
 	end
@@ -712,10 +763,20 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not homeCF[target.model] then
 			homeCF[target.model] = target.model:GetPivot()
 		end
+		local carry = playerStandsOn(target.model)
 		local before = target.model:GetPivot()
 		local turn = CFrame.fromAxisAngle(cam:GetRenderCFrame().UpVector, radians)
-		local after = CFrame.new(anchor) * turn * CFrame.new(-anchor) * before
+		local motion = CFrame.new(anchor) * turn * CFrame.new(-anchor)
+		local after = motion * before
 		target.model:PivotTo(after)
+		if carry then
+			-- The same rigid motion the floor made, not just its translation: an avatar at the
+			-- slab's far end swings with it instead of being left off the edge press by press.
+			local character = Players.LocalPlayer.Character
+			if character then
+				character:PivotTo(motion * character:GetPivot())
+			end
+		end
 		--[[ Turning about a point away from the pivot DISPLACES the pivot too. The position export
 		     has to see that, or the printed numbers will not reproduce the shot. ]]
 		moved[target.model] = (moved[target.model] or Vector3.zero) + (after.Position - before.Position)
@@ -780,7 +841,6 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			if ref.instance == target.model then
 				continue
 			end
-			local mine, theirs = overlapDepths(target.model, ref.instance)
 			local declared: string? = nil
 			if list then
 				for _, pin in list do
@@ -789,6 +849,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 					end
 				end
 			end
+			--[[ A declared rule is read at ITS OWN worst ray -- the exact measurement the solver
+			     enforces -- so "ok" means the whole sampled overlap obeys it. Undeclared rows read
+			     the dominant order, which is only a hint. ]]
+			local mine, theirs = overlapDepths(
+				target.model,
+				ref.instance,
+				if declared == nil then nil else declared == "front"
+			)
 			local inFront = false
 			if mine and theirs then
 				inFront = mine < theirs
@@ -811,6 +879,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			return
 		end
 
+		--[[ Every reads-column value below is sampled from the LIVE camera. Once the author has
+		     orbited off the composition view those readings describe the wrong picture -- a rule
+		     just solved correctly showed NOT YET beside a success message, which reads as "the
+		     tool is lying". Say where to stand instead. ]]
+		local awayFromCompose = not atComposeView()
 		local lines: { string } = {}
 		for i, row in rows do
 			local says = if row.declared == "front"
@@ -820,7 +893,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			--[[ What it says next to what it does. A declaration that has not taken effect is the
 			     thing the author most needs to see, and it is one glance rather than a query. ]]
 			local reads
-			if not row.overlaps then
+			if awayFromCompose then
+				reads = "orbit back to read"
+			elseif not row.overlaps then
 				reads = "no overlap yet"
 			elseif row.declared == nil then
 				reads = if row.inFront then "(in front)" else "(behind)"
@@ -1189,7 +1264,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local short = 0
 
 		for _, pin in list do
-			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance)
+			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance, pin.inFront)
 			if not mine or not theirs or not rayDir then
 				-- Nothing shares pixels here yet, so there is nothing to enforce. Skipped rather
 				-- than failed: the author declared an intention, not a claim about right now.
@@ -1440,8 +1515,18 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		syncPins()
 
 		if home and not target.apply then
-			-- The whole pose, so a tilt comes back too.
+			-- The whole pose, so a tilt comes back too -- and the avatar comes with the floor,
+			-- exactly as every applyDelta-driven move carries it: BACKSPACE used to reintroduce
+			-- the hanging-in-the-air drop this direct PivotTo bypassed.
+			local carry = playerStandsOn(target.model)
+			local before = target.model:GetPivot()
 			target.model:PivotTo(home)
+			if carry then
+				local character = Players.LocalPlayer.Character
+				if character then
+					character:PivotTo(character:GetPivot() + (home.Position - before.Position))
+				end
+			end
 		elseif offset then
 			-- Demo 4's rotor takes a translation only; its pose is re-issued from a stored home.
 			applyDelta(target, -offset)
@@ -1610,11 +1695,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local handle: Handle = {
 		toggle = function()
 			open = not open
-			if open and not hasWork() then
-				--[[ Whatever is on screen when the tool opens is what the shot is being framed
-				     from -- but ONLY while nothing has been declared yet. Recapturing over
-				     existing work silently rebased every pin onto whatever angle the author
-				     happened to reopen at; C stays the one explicit way to re-compose. ]]
+			--[[ Whatever is on screen when the tool opens is what the shot is being framed from --
+			     but ONLY while nothing has been declared yet: recapturing over existing work
+			     silently rebased every pin onto whatever angle the author happened to reopen at
+			     (C stays the one explicit way to re-compose). The nil case exists because rules
+			     typed into Studio's Properties BEFORE the first open make hasWork() true with no
+			     view ever captured -- and a nil composeCF read as "at the composition view"
+			     forever, so nothing gated and the rows never deferred. ]]
+			if open and (composeCF == nil or not hasWork()) then
 				composeCF = cam:GetRenderCFrame()
 			end
 			gui.Enabled = open
