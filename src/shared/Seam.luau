@@ -392,10 +392,12 @@ function Seam.newTraverser(nodes: { Node }, options: TraverserOptions): Traverse
 				if root then
 					for i, node in nodes do
 						local along, _, inMouth = measure(root.Position, node)
-						-- Only what the player is already standing AT OR PAST. Disarming everything
-						-- merely inside the mouth would kill the seam for someone waiting at the lip
-						-- for the world to connect -- which is precisely the player this is for.
-						if inMouth and along >= 0 then
+						--[[ Only what the player is measurably PAST -- not merely at. A standing
+						     R15 root can rest at along +0.2 with the trailing leg supported: the
+						     exact peer-over-the-edge stance held while keeping the camera still to
+						     settle. Disarming at >= 0 killed the seam for precisely that player,
+						     and the old re-arm band (below) then demanded a half-stud retreat. ]]
+						if inMouth and along > 0.25 then
 							disarmed[i] = true
 						end
 					end
@@ -427,8 +429,9 @@ function Seam.newTraverser(nodes: { Node }, options: TraverserOptions): Traverse
 				local a, _, inMouth = measure(at, node)
 				along[i] = a
 				inside[i] = inMouth
-				-- A disarmed node re-arms once the character has actually left its mouth.
-				if disarmed[i] and (not inMouth or a < -0.5) then
+				-- A disarmed node re-arms once the character is behind the plane at all; the
+				-- tenth of a stud is jitter margin, not a retreat requirement.
+				if disarmed[i] and (not inMouth or a < -0.1) then
 					disarmed[i] = nil
 				end
 			end

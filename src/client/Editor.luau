@@ -1332,12 +1332,15 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local any = false
 		local done: { [PVInstance]: boolean } = {}
 		for _, target in targets do
-			local offset = moved[target.model]
-			if offset and offset.Magnitude > 1e-4 and not done[target.model] then
+			local offset = moved[target.model] or Vector3.zero
+			local turn = tilted[target.model]
+			--[[ Tilt counts as an edit on its own: a tilt about an axis close to the pivot leaves
+			     the accumulated offset near zero, and the piece was silently missing from P. ]]
+			local edited = offset.Magnitude > 1e-4 or (turn ~= nil and math.abs(turn) > 1e-4)
+			if edited and not done[target.model] then
 				done[target.model] = true
 				any = true
 				print(("-- %s moved by (%.2f, %.2f, %.2f)"):format(target.id, offset.X, offset.Y, offset.Z))
-				local turn = tilted[target.model]
 				if turn and math.abs(turn) > 1e-4 then
 					--[[ A tilted piece is no longer described by a position alone, so print the
 					     whole orientation rather than leaving the reader to rebuild it. ]]
@@ -1350,6 +1353,16 @@ function Editor.new(targets: { Target }, options: Options): Handle
 							math.deg(rz)
 						)
 					)
+					--[[ Live this state is recoverable -- BACKSPACE. Pasted into the level file it
+					     boots that way permanently, so the paste-block itself carries the flag. ]]
+					for _, t in targets do
+						local tSeam = t.seams[1]
+						if t.model == target.model and tSeam and seamOrientationFault(tSeam) then
+							print(
+								`--   WARNING: this tilt puts the join to {t.joinsTo} past the crossing tolerance -- pasted back, that seam will never connect`
+							)
+						end
+					end
 				end
 				for _, line in target.export(offset) do
 					print("   " .. line)

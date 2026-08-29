@@ -92,6 +92,9 @@ local INTENDED: { { string } } = {
 	{ "S_end", "R_a" },
 	{ "R_b", "T_start" },
 }
+-- Editor-exported full poses (position + tilt) keyed by surface name; empty by default.
+Level.POSE = {} :: { [string]: CFrame }
+
 Level.INTENDED = INTENDED
 
 local REAL_EDGES: { { string } } = {}
@@ -247,6 +250,17 @@ function Level.build(origin: CFrame, parent: Instance): Handle
 		false,
 		Enum.Material.Neon
 	)
+
+	-- Full pivot overrides for the slabs, applied last (see Building.POSE in demo 3: this is
+	-- how a TILTED piece round-trips through the editor's export). The rotor is excluded -- its
+	-- pose is owned by rotorHome/setRotor.
+	for name, pose in Level.POSE do
+		local model = models[name]
+		if model and name ~= "R" then
+			-- The stored pose is origin-relative, matching every other table in this file.
+			model:PivotTo(origin * pose)
+		end
+	end
 
 	folder.Parent = parent
 

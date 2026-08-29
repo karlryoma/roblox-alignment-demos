@@ -77,7 +77,7 @@ local Demo4 = {}
 
 Demo4.id = "isometric"
 Demo4.title = "DEMO 4 — LOCKED ISOMETRIC"
-Demo4.blurb = "Four fixed angles, a turning bridge, sixteen baked graphs. Always settled."
+Demo4.blurb = "The view turns in quarter steps; so does the bridge. Find the two turns where edges meet on screen, and walk across the join."
 Demo4.ready = true
 Demo4.region = CFrame.new(0, 12000, 0)
 
@@ -187,8 +187,15 @@ function Demo4.start(ctx: Shell.Context): boolean
 		cam.FieldOfView = TUNE.fovDeg
 		local distance = fitDistance()
 
+		--[[ Assigned once the bake exists (below): a resize changes the fitted standoff, and
+		     graphs baked for the old distance would keep lighting seams the new camera cannot
+		     see joined. This connection outlives the assignment, so it is a forward hook. ]]
+		local rebakeForViewport: (() -> ())? = nil
 		local viewportConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
 			distance = fitDistance()
+			if rebakeForViewport then
+				rebakeForViewport()
+			end
 		end)
 		s.track(viewportConn)
 
@@ -220,15 +227,50 @@ function Demo4.start(ctx: Shell.Context): boolean
 			return camState * 4 + rotorState
 		end
 
+		--[[ Only the two authored pairs may ever become crossings. Level.luau promises "neither
+		     seam is live in any other of the sixteen states", but the nearest UNINTENDED pair
+		     (S_end~R_b at one state) clears epsilon by only 2% at 16:9 -- and a portrait window
+		     grows the fitted standoff until it, and a second stray pair, fall INSIDE epsilon with
+		     perfectly opposed faces. Enforcing the design structurally beats chasing margins. ]]
+		local intendedPair: { [string]: boolean } = {}
+		for _, pair in Level.INTENDED do
+			intendedPair[`{pair[1]}|{pair[2]}`] = true
+			intendedPair[`{pair[2]}|{pair[1]}`] = true
+		end
+
 		local function bakeAll()
+			local dropped = 0
 			for rotorState = 0, 3 do
 				-- The rotor must PHYSICALLY be in each state: Seam reads live Attachment
 				-- WorldCFrames, which is exactly what makes a rotated seam correct.
 				level.setRotor(rotorState)
 				for camState = 0, 3 do
-					graphs[key(camState, rotorState)] =
-						Seam.build(nodes, cframeForYaw(math.rad(TUNE.yawDeg[camState + 1])), seamOptions)
+					local graph = Seam.build(nodes, cframeForYaw(math.rad(TUNE.yawDeg[camState + 1])), seamOptions)
+					for i = #graph.edges, 1, -1 do
+						local edge = graph.edges[i]
+						if not intendedPair[`{nodes[edge.a].id}|{nodes[edge.b].id}`] then
+							table.remove(graph.edges, i)
+							-- byNode is part of the Graph contract; leaving the dropped pair in the
+							-- adjacency would hand the next byNode consumer exactly the unintended
+							-- crossings this filter removes.
+							local ofA = table.find(graph.byNode[edge.a], edge.b)
+							if ofA then
+								table.remove(graph.byNode[edge.a], ofA)
+							end
+							local ofB = table.find(graph.byNode[edge.b], edge.a)
+							if ofB then
+								table.remove(graph.byNode[edge.b], ofB)
+							end
+							dropped += 1
+						end
+					end
+					graphs[key(camState, rotorState)] = graph
 				end
+			end
+			if dropped > 0 then
+				-- Visible, not silent: a dropped edge means the geometry drifted close enough to
+				-- coincide by accident, which the author may want to know about.
+				print(`[demo4] bake dropped {dropped} unintended coincidence(s) -- only INTENDED pairs connect`)
 			end
 		end
 
@@ -328,11 +370,15 @@ function Demo4.start(ctx: Shell.Context): boolean
 			flashFor = 0.3
 			-- Always restored to something true: guarding this on `not solved` left the line reading
 			-- "rotating" forever after the first post-solve rotation.
+			--[[ The hunt is 4 views x 4 bridge turns; without a position readout the player cannot
+			     tell which of the sixteen they have already tried, and nothing ever said a live
+			     seam is something you WALK across. ]]
+			local where = `view {camState + 1}/4 · bridge {rotorState + 1}/4`
 			hud.setState(
 				if solved
 					then "SOLVED — one angle, one turn, one route"
-					elseif #graph.edges > 0 then `{#graph.edges} seam(s) live`
-					else "nothing coincides from here"
+					elseif #graph.edges > 0 then `{#graph.edges} seam(s) live · {where} · walk across the lit bar`
+					else `nothing coincides · {where}`
 			)
 		end
 
@@ -483,6 +529,24 @@ function Demo4.start(ctx: Shell.Context): boolean
 									movedPivot.Z
 								)
 							)
+						end
+						--[[ Same POSE round-trip as demo 3: a tilted slab cannot be expressed in
+						     the position-only tables, so it exports one pivot line that Level.build
+						     applies by PivotTo. The rotor is EXCLUDED by name, not by trusting
+						     applyTilt's refusal: setRotor itself rotates the pivot, so at states
+						     1-3 the rotation test reads 90/180 degrees and would emit a POSE line
+						     the build ignores while skipping the NODES lines the rotor needs. ]]
+						-- Origin-relative, like every other exported number (see demo 3).
+						local pose = level.origin:ToObjectSpace(level.models[surfaceName]:GetPivot())
+						local rx, ry, rz = pose:ToEulerAnglesYXZ()
+						if surfaceName ~= "R" and math.max(math.abs(rx), math.abs(ry), math.abs(rz)) > 1e-4 then
+							table.insert(
+								lines,
+								(
+									'Level.POSE["%s"] = CFrame.new(%.3f, %.3f, %.3f) * CFrame.fromEulerAnglesYXZ(%.6f, %.6f, %.6f)'
+								):format(surfaceName, pose.X, pose.Y, pose.Z, rx, ry, rz)
+							)
+							return lines
 						end
 						local at = Level.SURFACE_AT[surfaceName]
 						if at then
@@ -648,6 +712,21 @@ function Demo4.start(ctx: Shell.Context): boolean
 		-- bake and report
 		--------------------------------------------------------------------------------
 		bakeAll()
+		local needsRebake = false
+		rebakeForViewport = function()
+			--[[ Mid-turn, connectivity is deliberately undefined: beginTurn/beginRotor cleared the
+			     graph and the HUD says "rotating". Re-baking NOW would stomp that state line,
+			     flash the bars, and snap the interpolating deck to its end pose for a frame -- so
+			     the work is deferred to the turn-end installGraph that already runs. ]]
+			if turning > 0 then
+				needsRebake = true
+				return
+			end
+			bakeAll()
+			-- bakeAll leaves the rotor at state 3; put the live state back before reading graphs.
+			level.setRotor(rotorState)
+			installGraph()
+		end
 		level.setRotor(rotorState)
 
 		do
@@ -773,6 +852,11 @@ function Demo4.start(ctx: Shell.Context): boolean
 					     open used to hand the avatar its walk speed back mid-edit, and Up/Down
 					     then nudged the piece AND walked the character off the slab. ]]
 					setWalkable(not editor.isOpen())
+					if needsRebake then
+						needsRebake = false
+						bakeAll()
+						level.setRotor(rotorState)
+					end
 					installGraph()
 				end
 			end

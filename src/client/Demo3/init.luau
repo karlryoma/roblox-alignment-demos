@@ -138,7 +138,11 @@ function Demo3.start(ctx: Shell.Context): boolean
 			local a, b = nodes[indexById[pair[1]]], nodes[indexById[pair[2]]]
 			local fault = Seam.orientationFault(a, b)
 			if fault then
-				error(`demo 3: intended seam {pair[1]}-{pair[2]} is not crossable: {fault}`, 0)
+				--[[ A warning, not an error: a pasted POSE line can now carry a tilt past the
+				     crossing tolerance, and refusing to BOOT over it turned a recoverable
+				     authoring state into a hand-edit-the-file lockout. The settle HUD and the
+				     editor's tilt warning both name the problem at runtime. ]]
+				warn(`[demo3] intended seam {pair[1]}-{pair[2]} is not crossable as authored: {fault}`)
 			end
 		end
 
@@ -316,6 +320,11 @@ function Demo3.start(ctx: Shell.Context): boolean
 		-- Assigned in the editor wiring below; settle() is defined before the editor exists.
 		local editorHasTilt: (() -> boolean)? = nil
 		local stillFor = 0
+		--[[ The camera boots exactly on target, so the first settle lands at t = dwellTime --
+		     the same moment the entry fade ends -- and its hint overwrote the intro line (the
+		     only on-screen mention of M) before anyone could read it. The intro hint stands
+		     until the player has actually orbited once. ]]
+		local hasDragged = false
 		local prevYaw, prevPitch = orbit.get()
 		local settleYaw, settlePitch = 0, 0
 		local prox = 0
@@ -348,7 +357,14 @@ function Demo3.start(ctx: Shell.Context): boolean
 			traverser.setGraph(nil, nil)
 			if not solved then
 				hud.setState("")
-				hud.setHint("hold the camera still to weave")
+				--[[ Until the first drag this is the intro line, M mention included: R triggers
+				     unsettle without any drag, and the bare version stranded a player who had not
+				     yet found the orbit with no M and no what-next. ]]
+				hud.setHint(
+					if hasDragged
+						then "hold the camera still to weave"
+						else "hold the camera still to weave · M edits the map"
+				)
 			end
 		end
 
@@ -386,20 +402,28 @@ function Demo3.start(ctx: Shell.Context): boolean
 					table.insert(names, `{nodes[edge.a].id}~{nodes[edge.b].id}`)
 				end
 				hud.setState(`WOVEN — {table.concat(names, ", ")}`)
-				hud.setHint("walk into a lit seam")
+				if hasDragged then
+					hud.setHint("walk into a lit seam")
+				end
 			elseif graph.rejectedOrientation > 0 and editorHasTilt ~= nil and editorHasTilt() then
 				--[[ A pair LINES UP from here but its faces no longer oppose, AND a tilt exists to
 				     blame. The tilt condition matters: three authored pairs coincide at reachable
 				     angles with faces ninety degrees apart, and blaming a tilt on a pristine map
 				     would send the author undoing edits they never made. ]]
 				hud.setState("SETTLED — a seam lines up here but its faces no longer oppose")
-				hud.setHint("a tilted piece? M opens the editor, BACKSPACE puts it back")
+				if hasDragged then
+					hud.setHint("a tilted piece? M opens the editor, BACKSPACE puts it back")
+				end
 			elseif graph.rejectedHidden > 0 then
 				hud.setState("SETTLED — a seam lines up here but a pole hides it")
-				hud.setHint("try another angle · M edits the map")
+				if hasDragged then
+					hud.setHint("try another angle · M edits the map")
+				end
 			else
 				hud.setState("SETTLED — nothing coincides from here")
-				hud.setHint("try another angle · drag orbits · M edits the map")
+				if hasDragged then
+					hud.setHint("try another angle · drag orbits · M edits the map")
+				end
 			end
 		end
 
@@ -465,6 +489,26 @@ function Demo3.start(ctx: Shell.Context): boolean
 					},
 					export = function(offset: Vector3): { string }
 						local lines: { string } = {}
+						--[[ A TILTED piece cannot round-trip through the position-only tables: the
+						     tilt pivots on the seam node, so `at + offset` misplaces BOTH nodes by
+						     the pivot's displacement (~0.1-0.2 studs per 2 deg, and the coincidence
+						     pose drifts with it). One absolute POSE line reproduces the whole
+						     thing -- Building.build applies it by PivotTo, exactly like the live
+						     edit. ]]
+						-- Origin-relative, like every other exported number: the live pivot carries
+						-- the demo's region offset (thousands of studs), and baking that into the
+						-- file would break the one convention the origin parameter exists for.
+						local pose = building.origin:ToObjectSpace(building.models[surfaceName]:GetPivot())
+						local rx, ry, rz = pose:ToEulerAnglesYXZ()
+						if math.max(math.abs(rx), math.abs(ry), math.abs(rz)) > 1e-4 then
+							table.insert(
+								lines,
+								(
+									'Building.POSE["%s"] = CFrame.new(%.3f, %.3f, %.3f) * CFrame.fromEulerAnglesYXZ(%.6f, %.6f, %.6f)'
+								):format(surfaceName, pose.X, pose.Y, pose.Z, rx, ry, rz)
+							)
+							return lines
+						end
 						for _, surface in Building.SURFACES do
 							if surface.name == surfaceName then
 								local at = surface.at + offset
@@ -655,6 +699,46 @@ function Demo3.start(ctx: Shell.Context): boolean
 						math.deg(pitch)
 					)
 				)
+				--[[ Assert the pair CONNECTS at its own pose, not just that it coincides. The
+				     aggregate sweep below cannot tell two live seams from one seam counted at two
+				     angles, and its healthy-reading summary printed identically for a completable
+				     route and a dead one. A pair can coincide yet be rejected -- pole in the way,
+				     faces no longer opposed, pose outside the pitch clamp -- and each of those is
+				     a different authoring mistake, so name it. ]]
+				if math.deg(pitch) < TUNE.minPitchDeg or math.deg(pitch) > TUNE.maxPitchDeg then
+					warn(
+						("[demo3] INTENDED seam %s~%s coincides only at pitch %.1f deg -- outside the [%d, %d] clamp: unreachable"):format(
+							pair[1],
+							pair[2],
+							math.deg(pitch),
+							TUNE.minPitchDeg,
+							TUNE.maxPitchDeg
+						)
+					)
+				else
+					local probe = CFrame.lookAt(
+						focusWorld + Align.fromSpherical(yaw, pitch, 1) * opts.distance,
+						focusWorld
+					)
+					local g = Seam.build(nodes, probe, seamOptions)
+					local connected = false
+					for _, edge in g.edges do
+						local ea, eb = nodes[edge.a].id, nodes[edge.b].id
+						if (ea == pair[1] and eb == pair[2]) or (ea == pair[2] and eb == pair[1]) then
+							connected = true
+						end
+					end
+					if not connected then
+						warn(
+							("[demo3] INTENDED seam %s~%s does NOT connect at its own pose (rejected: %d hidden, %d orientation) -- the route may be uncompletable"):format(
+								pair[1],
+								pair[2],
+								g.rejectedHidden,
+								g.rejectedOrientation
+							)
+						)
+					end
+				end
 			end
 			print(`[demo3] {#nodes} nodes, {found} intended seams, all orientation-checked`)
 			print("[demo3] press M in-game for the map editor (F2 also works outside Studio)")
@@ -705,6 +789,7 @@ function Demo3.start(ctx: Shell.Context): boolean
 
 			local f = drag.consume()
 			if f.dx ~= 0 or f.dy ~= 0 then
+				hasDragged = true
 				orbit.turn(f.dx, f.dy)
 			end
 			orbit.step(dt)

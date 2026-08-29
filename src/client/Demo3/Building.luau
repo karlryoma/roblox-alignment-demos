@@ -79,6 +79,9 @@ local NODES: { NodeSpec } = {
 Building.NODES = NODES
 
 --[[ The pairs the level intends. Asserted at boot, and reported per angle. ]]
+-- Editor-exported full poses (position + tilt) keyed by surface name; empty by default.
+Building.POSE = {} :: { [string]: CFrame }
+
 Building.INTENDED = {
 	{ "A_end", "B_start" },
 	{ "B_end", "C_start" },
@@ -224,6 +227,19 @@ function Building.build(origin: CFrame, parent: Instance): Handle
 		false,
 		Enum.Material.Neon
 	)
+
+	--[[ Full pivot overrides, applied LAST. Position-only tables cannot represent a TILTED
+	     surface (the editor's G/H), so the editor exports one POSE line for a tilted piece and
+	     this PivotTo reproduces it exactly -- slab, skirt, markers and seam attachments move
+	     together, the same way the live edit did. POSE wins over an edited `at` by construction:
+	     it is absolute. ]]
+	for name, pose in Building.POSE do
+		local model = models[name]
+		if model then
+			-- The stored pose is origin-relative, matching every other table in this file.
+			model:PivotTo(origin * pose)
+		end
+	end
 
 	folder.Parent = parent
 
