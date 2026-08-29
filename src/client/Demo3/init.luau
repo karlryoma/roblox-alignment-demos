@@ -319,6 +319,11 @@ function Demo3.start(ctx: Shell.Context): boolean
 		local editing = false
 		-- Assigned in the editor wiring below; settle() is defined before the editor exists.
 		local editorHasTilt: (() -> boolean)? = nil
+		--[[ The per-view ORDERING presentation: realized when the camera settles at the view an
+		     ordering was composed for, removed when it leaves. Orderings never move the authored
+		     map -- perspective changes, platforms do not. ]]
+		local realizeOrders: (() -> ())? = nil
+		local unrealizeOrders: (() -> ())? = nil
 		local stillFor = 0
 		--[[ The camera boots exactly on target, so the first settle lands at t = dwellTime --
 		     the same moment the entry fade ends -- and its hint overwrote the intro line (the
@@ -399,8 +404,12 @@ function Demo3.start(ctx: Shell.Context): boolean
 			liveEdges = 0
 			table.clear(liveBars)
 			traverser.setGraph(nil, nil)
-			-- The snap only ever exists inside a settle: orbiting away shows honest geometry.
+			-- The snap and the ordering presentation only ever exist inside a settle: orbiting
+			-- away shows the honest, authored geometry.
 			revertSnaps()
+			if unrealizeOrders then
+				unrealizeOrders()
+			end
 			if not solved then
 				hud.setState("")
 				--[[ Until the first drag this is the intro line, M mention included: R triggers
@@ -421,6 +430,15 @@ function Demo3.start(ctx: Shell.Context): boolean
 			-- Measure the honest geometry: a re-settle (editor onChanged) must not snap on top
 			-- of a previous snap.
 			revertSnaps()
+			--[[ Realize the orderings for THIS view before the graph is read: the presented world
+			     is the one the player sees, so it is the one the seams and snaps must agree with.
+			     (Ordering slides run along eye rays, so seam coincidence barely moves.) ]]
+			if unrealizeOrders then
+				unrealizeOrders()
+			end
+			if not editing and realizeOrders then
+				realizeOrders()
+			end
 			local graph = Seam.build(nodes, cam:GetRenderCFrame(), seamOptions)
 			if not editing then
 				local eye = cam:GetRenderCFrame().Position
@@ -669,6 +687,30 @@ function Demo3.start(ctx: Shell.Context): boolean
 			camera = cam,
 			playerGui = ctx.playerGui,
 			references = editorReferences,
+			--[[ The fall catch's safe spot may have been latched while standing on a PRESENTED
+			     piece; when the presentation reverts, that spot points at empty air where the
+			     piece used to be, and the catch would loop the player there. Re-base it with the
+			     piece it was latched over. ]]
+			onPreviewReverted = function(model: PVInstance, delta: Vector3)
+				local cf: CFrame, size: Vector3
+				if model:IsA("Model") then
+					cf, size = model:GetBoundingBox()
+				elseif model:IsA("BasePart") then
+					cf, size = model.CFrame, model.Size
+				else
+					return
+				end
+				local p = cf:PointToObjectSpace(lastSafe.Position)
+				if
+					math.abs(p.X) <= size.X / 2 + 3
+					and math.abs(p.Z) <= size.Z / 2 + 3
+					and p.Y >= 0
+					and p.Y <= size.Y / 2 + 8
+				then
+					lastSafe -= delta
+				end
+			end,
+
 			-- A moved surface invalidates whatever was settled: rebuild it so the lit seams and
 			-- the readout always describe the geometry as it is now.
 			onChanged = function()
@@ -708,6 +750,8 @@ function Demo3.start(ctx: Shell.Context): boolean
 			end
 		end
 		editorHasTilt = editor.hasTiltWork
+		realizeOrders = editor.realizeOrders
+		unrealizeOrders = editor.unrealizeOrders
 
 		local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
 			if processed then

@@ -23,11 +23,18 @@
 	re-established by a sweep after EVERY later change, so a composition accumulates instead of
 	coming apart as soon as the next piece moves.
 
-	ORDER IS STATED PER PIECE, NOT PER PAIR, and lives in two attributes ON the piece --
-	AlignInFrontOf and AlignBehind, each a comma-separated list of piece names. One key per listed
-	piece cycles it: in front -> behind -> don't care. There is no pair cursor and nothing to
-	navigate, and because the field belongs to the Instance, Studio's Properties window is an
-	equally good way in.
+	ORDER IS STATED PER PIECE, NOT PER PAIR, and lives in attributes ON the piece --
+	AlignInFrontOf and AlignBehind (comma-separated piece names) plus AlignView, the CFrame it
+	was composed from. One key per listed piece cycles it: in front -> behind -> don't care.
+	Because the fields belong to the Instance, Studio's Properties window is an equally good
+	way in.
+
+	AN ORDER NEVER MOVES THE MAP. It is a statement about a PERSPECTIVE, so it is realized as a
+	TEMPORARY presentation offset -- solved and applied only while the camera is at the view it
+	was composed from (the demos call realizeOrders/unrealizeOrders around their settles), and
+	reverted everywhere else. The authored geometry, the export, and the save file never change
+	for an ordering; joins and hand nudges remain real, authored edits, and the crossing
+	teleport is what carries the player between them.
 
 	That is the lesson from Monument Valley, whose team built the hand-maintained version of this
 	first: "as soon as you wanted to modify that or iterate on it, you'd have to do it all over
@@ -106,6 +113,12 @@ export type Target = {
 export type Handle = {
 	toggle: () -> (),
 	isOpen: () -> boolean,
+	--[[ Apply / remove the ordering presentation for the CURRENT camera: solve every pin whose
+	     stored view matches where the camera is now, as temporary offsets. The demos call
+	     realize when the camera settles at a view and unrealize when it leaves -- orderings are
+	     properties of a perspective, not of the map. ]]
+	realizeOrders: () -> (),
+	unrealizeOrders: () -> (),
 	--[[ Whether any piece currently carries a tilt. A demo's "faces no longer oppose" hint must
 	     only blame a tilt when one exists -- the authored maps have pairs that coincide at some
 	     angles with faces ninety degrees apart, and those are nobody's mistake. ]]
@@ -133,6 +146,11 @@ export type Options = {
 	--[[ Whether authoring is legal right now -- demo 4 says no mid-rotation, because the camera is
 	     then showing an angle the game can never settle at. ]]
 	canSolve: (() -> boolean)?,
+	--[[ Called for each piece as its presentation offset is removed, BEFORE the piece moves
+	     back -- so the demo can re-base anything it latched in the presented frame (its fall-
+	     catch safe spot chiefly: a safe pose captured on a presented platform pointed at empty
+	     air once the platform went home). ]]
+	onPreviewReverted: ((model: PVInstance, delta: Vector3) -> ())?,
 	references: { Reference }?,
 	camera: Camera,
 	playerGui: Instance,
@@ -176,6 +194,34 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	--[[ The pose a piece held before the author first touched it. Undo restores this directly:
 	     translating by -offset cannot take a TILT back, so undo used to leave a piece rotated. ]]
 	local homeCF: { [PVInstance]: CFrame } = {}
+	--[[ An ordering is a statement about a PICTURE, so it carries the view it was composed from.
+	     It is REALIZED -- solved and applied -- only while the camera is at that view, as a
+	     temporary presentation offset, and reverted everywhere else. The authored map never
+	     moves for an ordering: perspective changes, platforms do not. ]]
+	type Pin = { other: Reference, inFront: boolean, view: CFrame? }
+
+	--[[ Temporary presentation offsets realizing the orderings: applied while the camera is at
+	     the view they were composed for, reverted everywhere else. NEVER in moved[], never in
+	     homeCF, never exported -- the authored map does not move for an ordering. ]]
+	local previewed: { [PVInstance]: Vector3 } = {}
+
+	--[[ Whether a pin's stored view matches a given camera. Looser than the compose gate: an
+	     ordering flips over whole studs, not sub-degrees. A pin with no stored view (hand-typed
+	     attributes without AlignView) matches everywhere. ]]
+	local PIN_VIEW_DOT = math.cos(math.rad(2.5))
+	local function pinMatchesView(pin: Pin, refCF: CFrame?): boolean
+		local view = pin.view
+		if not view or not refCF then
+			return true
+		end
+		if refCF.LookVector:Dot(view.LookVector) < PIN_VIEW_DOT then
+			return false
+		end
+		local delta = refCF.Position - view.Position
+		local across = delta - view.LookVector * delta:Dot(view.LookVector)
+		return across.Magnitude <= 4
+	end
+
 	--[[ Notes from the last sweep worth saying out loud -- currently: which pieces a shortfall
 	     was delegated to. Success with a side effect, not a failure. Deduplicated: the sweep runs
 	     four rounds and a repeating delegation must not stack four copies of itself. ]]
@@ -343,7 +389,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		is per PAIR and a surface may carry any number of them -- which is what lets a CYCLE be
 		expressed at all.
 	]]
-	type Pin = { other: Reference, inFront: boolean }
+	-- (type Pin is declared above, near its first use)
 	local pins: { [PVInstance]: { Pin } } = {}
 
 	--[[
@@ -419,6 +465,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	local lastTouched: Instance? = nil
 
 	local ATTR_FRONT = "AlignInFrontOf"
+	local ATTR_VIEW = "AlignView"
 	local ATTR_BACK = "AlignBehind"
 
 	--[[ Which of a piece's rules could not be honoured on the last sweep, so its row can say so
@@ -436,7 +483,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	--[[ Names that match nothing are skipped rather than treated as an error: this field is meant
 	     to be typed by hand in Studio, where a half-finished list is a normal thing to look at. ]]
-	local function parseList(raw: any, inFront: boolean, out: { Pin })
+	local function parseList(raw: any, inFront: boolean, view: CFrame?, out: { Pin })
 		if typeof(raw) ~= "string" then
 			return
 		end
@@ -444,7 +491,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			local name = string.match(piece, "^%s*(.-)%s*$")
 			local ref = if name then refByName(name) else nil
 			if ref then
-				table.insert(out, { other = ref, inFront = inFront })
+				table.insert(out, { other = ref, inFront = inFront, view = view })
 			end
 		end
 	end
@@ -453,8 +500,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		table.clear(pins)
 		for _, target in targets do
 			local list: { Pin } = {}
-			parseList(target.model:GetAttribute(ATTR_FRONT), true, list)
-			parseList(target.model:GetAttribute(ATTR_BACK), false, list)
+			local rawView = target.model:GetAttribute(ATTR_VIEW)
+			local view: CFrame? = if typeof(rawView) == "CFrame" then rawView else nil
+			parseList(target.model:GetAttribute(ATTR_FRONT), true, view, list)
+			parseList(target.model:GetAttribute(ATTR_BACK), false, view, list)
 			if #list > 0 then
 				pins[target.model] = list
 			end
@@ -469,6 +518,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		model:SetAttribute(ATTR_FRONT, table.concat(front, ", "))
 		model:SetAttribute(ATTR_BACK, table.concat(back, ", "))
+		--[[ The view rides along as a CFrame attribute, so a Studio-typed rule set can carry its
+		     own view too (paste it from a P export, or leave it absent to mean "any view"). One
+		     view per piece: rules on one piece are composed together, from one place. ]]
+		if #list > 0 then
+			model:SetAttribute(ATTR_VIEW, composeCF or cam:GetRenderCFrame())
+		else
+			model:SetAttribute(ATTR_VIEW, nil)
+		end
 	end
 
 	--[[
@@ -714,12 +771,15 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 	--[[ Move a target without triggering a sweep: the primitive every automatic pass is built
 	     from. moveBy is the authored version and reconciles afterwards. ]]
-	local function applyDelta(target: Target, delta: Vector3)
+	local function applyDelta(target: Target, delta: Vector3, preview: boolean?)
 		if delta.Magnitude < 1e-6 then
 			return
 		end
-		if not homeCF[target.model] then
-			homeCF[target.model] = target.model:GetPivot()
+		if not preview and not homeCF[target.model] then
+			--[[ The AUTHORED pose, not the presented one: a live ordering offset in the capture
+			     turned BACKSPACE into "plant the piece a preview-width off its real home,
+			     permanently". Previews are pure translations, so subtracting is exact. ]]
+			homeCF[target.model] = target.model:GetPivot() - (previewed[target.model] or Vector3.zero)
 		end
 		-- Checked BEFORE the piece moves, or the box has already left the avatar behind.
 		local carry = playerStandsOn(target.model)
@@ -735,7 +795,52 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				character:PivotTo(character:GetPivot() + delta)
 			end
 		end
-		moved[target.model] = (moved[target.model] or Vector3.zero) + delta
+		if preview then
+			previewed[target.model] = (previewed[target.model] or Vector3.zero) + delta
+		else
+			moved[target.model] = (moved[target.model] or Vector3.zero) + delta
+		end
+	end
+
+	local function targetFor(inst: Instance): Target?
+		--[[ A model can appear as several entries (one per seam it carries), and their slide axes
+		     differ once one is locked: prefer the LOCKED entry, so a delegated slide runs along
+		     the ray that keeps its join -- the first-listed entry is otherwise arbitrary. ]]
+		local fallback: Target? = nil
+		for _, t in targets do
+			if t.model == inst then
+				local tSeam = t.seams[1]
+				if tSeam and locked[tSeam.label] then
+					return t
+				end
+				fallback = fallback or t
+			end
+		end
+		return fallback
+	end
+
+	--[[ Take every presentation offset back out of the world, carrying the avatar with any floor
+	     it stands on. The authored geometry (hand nudges, tilts, joins) is untouched. ]]
+	local function revertPreview()
+		for model, delta in previewed do
+			if options.onPreviewReverted then
+				options.onPreviewReverted(model, delta)
+			end
+			local target = targetFor(model)
+			local carry = playerStandsOn(model)
+			if target and target.apply then
+				target.apply(-delta)
+			else
+				model:PivotTo(model:GetPivot() - delta)
+			end
+			if carry then
+				local character = Players.LocalPlayer.Character
+				if character then
+					character:PivotTo(character:GetPivot() - delta)
+				end
+			end
+		end
+		table.clear(previewed)
 	end
 
 	--[[
@@ -761,7 +866,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local seam = target.seams[1]
 		local anchor = if seam then seam.node.WorldPosition else target.model:GetPivot().Position
 		if not homeCF[target.model] then
-			homeCF[target.model] = target.model:GetPivot()
+			-- Authored pose, preview subtracted -- same reasoning as applyDelta's capture.
+			homeCF[target.model] = target.model:GetPivot() - (previewed[target.model] or Vector3.zero)
 		end
 		local carry = playerStandsOn(target.model)
 		local before = target.model:GetPivot()
@@ -828,7 +934,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return true
 	end
 
-	type Row = { ref: Reference, overlaps: boolean, inFront: boolean, declared: string?, clashes: boolean }
+	type Row = { ref: Reference, overlaps: boolean, inFront: boolean, declared: string?, clashes: boolean, otherView: boolean }
 
 	--[[ Every other piece, with what the author has DECLARED about it and how it currently READS.
 	     Non-overlapping pieces stay in the list -- the author is stating an intention, and a pair
@@ -842,10 +948,12 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				continue
 			end
 			local declared: string? = nil
+			local otherView = false
 			if list then
 				for _, pin in list do
 					if pin.other.instance == ref.instance then
 						declared = if pin.inFront then "front" else "back"
+						otherView = not pinMatchesView(pin, composeCF)
 					end
 				end
 			end
@@ -867,6 +975,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				inFront = inFront,
 				declared = declared,
 				clashes = clash ~= nil and clash[ref.instance] == true,
+				otherView = otherView,
 			})
 		end
 		return out
@@ -893,7 +1002,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			--[[ What it says next to what it does. A declaration that has not taken effect is the
 			     thing the author most needs to see, and it is one glance rather than a query. ]]
 			local reads
-			if awayFromCompose then
+			if row.declared ~= nil and row.otherView then
+				reads = "made for another view"
+			elseif awayFromCompose then
 				reads = "orbit back to read"
 			elseif not row.overlaps then
 				reads = "no overlap yet"
@@ -1108,11 +1219,15 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		     THIS VIEW -- so later work on other pieces, composed from other views, cannot pull
 		     this one apart again. ]]
 		local partnerModel = seam.partner:FindFirstAncestorOfClass("Model")
+		--[[ Both bases in the AUTHORED frame: attachments ride their model, so a live ordering
+		     offset on either side would bake into the lock and re-solve the join to the wrong
+		     spot on every later sweep. ]]
 		locked[seam.label] = {
 			eye = cam:GetRenderCFrame().Position,
-			nodeBase = seam.node.WorldPosition,
+			nodeBase = seam.node.WorldPosition - (previewed[target.model] or Vector3.zero),
 			nodeMovedBase = moved[target.model] or Vector3.zero,
-			partnerBase = seam.partner.WorldPosition,
+			partnerBase = seam.partner.WorldPosition
+				- (if partnerModel then (previewed[partnerModel] or Vector3.zero) else Vector3.zero),
 			partnerModel = partnerModel,
 			partnerMovedBase = if partnerModel then (moved[partnerModel] or Vector3.zero) else Vector3.zero,
 		}
@@ -1213,24 +1328,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		return slideAxis(target)
 	end
 
-	local function targetFor(inst: Instance): Target?
-		--[[ A model can appear as several entries (one per seam it carries), and their slide axes
-		     differ once one is locked: prefer the LOCKED entry, so a delegated slide runs along
-		     the ray that keeps its join -- the first-listed entry is otherwise arbitrary. ]]
-		local fallback: Target? = nil
-		for _, t in targets do
-			if t.model == inst then
-				local tSeam = t.seams[1]
-				if tSeam and locked[tSeam.label] then
-					return t
-				end
-				fallback = fallback or t
-			end
-		end
-		return fallback
-	end
-
-	local function applyOne(target: Target, allowDelegate: boolean): (boolean, string?)
+	local function applyOne(target: Target, allowDelegate: boolean, refView: CFrame?): (boolean, string?)
 		local list = pins[target.model]
 		conflicts[target.model] = nil
 		if not list or #list == 0 then
@@ -1264,6 +1362,10 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		local short = 0
 
 		for _, pin in list do
+			if not pinMatchesView(pin, refView) then
+				-- Composed from another view: realized there, invisible here. Not this sweep's business.
+				continue
+			end
 			local mine, theirs, rayDir = overlapDepths(target.model, pin.other.instance, pin.inFront)
 			if not mine or not theirs or not rayDir then
 				-- Nothing shares pixels here yet, so there is nothing to enforce. Skipped rather
@@ -1320,14 +1422,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 						local converging = prev == nil or math.abs(u) < prev * 0.75
 						if math.abs(u) <= 25 and converging then
 							delegateHistory[pin] = math.abs(u)
-							applyDelta(other, axisO * u)
+							applyDelta(other, axisO * u, true)
 							if (pin.inFront and k > 0) or (not pin.inFront and k < 0) then
 								highest = math.min(highest, boundary)
 							else
 								lowest = math.max(lowest, boundary)
 							end
 							note(
-								`moved {other.id} {("%.1f"):format(math.abs(u))} studs to put {target.id} {if pin.inFront then "in front of" else "behind"} it`
+								`presenting {other.id} {("%.1f"):format(math.abs(u))} studs {if u > 0 then "deeper" else "nearer"} at this view so {target.id} reads {if pin.inFront then "in front" else "behind"}`
 							)
 							delegated = true
 						end
@@ -1357,7 +1459,8 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			return false, `satisfying this rule would slide {target.id} {("%.0f"):format(math.abs(t))} studs -- refusing`
 		end
 		if math.abs(t) > 1e-4 then
-			applyDelta(target, dir * t)
+			-- An ordering slide is PRESENTATION: temporary, per-view, never part of the map.
+			applyDelta(target, dir * t, true)
 		end
 		if #dropped > 0 then
 			conflicts[target.model] = clash
@@ -1396,6 +1499,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		table.clear(sweepNotes)
 		table.clear(delegateHistory)
+		--[[ Start from the authored world: orderings are re-realized from scratch each sweep, so
+		     they can never accumulate into the map. ]]
+		revertPreview()
 		local problem: string? = nil
 		for _ = 1, 4 do
 			for _, target in targets do
@@ -1410,7 +1516,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				end
 			end
 			for _, target in targets do
-				applyOne(target, true)
+				applyOne(target, true, composeCF)
 			end
 		end
 		--[[ THE VERIFICATION PASS decides what is true. A delegated move can be reverted by the
@@ -1421,7 +1527,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		     dropped, marked on its row, and named in the return. ]]
 		problem = nil
 		for _, target in targets do
-			local ok, why = applyOne(target, false)
+			local ok, why = applyOne(target, false, composeCF)
 			if not ok then
 				problem = why
 			end
@@ -1495,6 +1601,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			say(`cannot undo: {blockedBy}`, false)
 			return
 		end
+		--[[ Presentation off first: the authored restore below must not fight a live ordering
+		     offset, and the reconcile at the end re-realizes whatever still applies. ]]
+		revertPreview()
 		local home = homeCF[target.model]
 		local offset = moved[target.model]
 		if not home and not offset then
@@ -1512,6 +1621,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		end
 		target.model:SetAttribute(ATTR_FRONT, "")
 		target.model:SetAttribute(ATTR_BACK, "")
+		target.model:SetAttribute(ATTR_VIEW, nil)
 		syncPins()
 
 		if home and not target.apply then
@@ -1541,6 +1651,11 @@ function Editor.new(targets: { Target }, options: Options): Handle
 	end
 
 	local function printExport()
+		--[[ The export must read the AUTHORED world: the demos' export closures read live pivots
+		     (a tilted piece's POSE line, a pole's position), and printing them with an ordering
+		     presentation applied would paste those offsets into the level file -- the one thing
+		     this whole design promises never happens. Re-realized after printing. ]]
+		revertPreview()
 		print("---- map edits ----")
 		local any = false
 		local done: { [PVInstance]: boolean } = {}
@@ -1585,7 +1700,29 @@ function Editor.new(targets: { Target }, options: Options): Handle
 		if not any then
 			print("-- nothing moved yet")
 		end
+		for _, target in targets do
+			local list = pins[target.model]
+			if list and #list > 0 and not done[target.model] then
+				done[target.model] = true
+				local view = target.model:GetAttribute(ATTR_VIEW)
+				if typeof(view) == "CFrame" then
+					local yaw = math.deg(math.atan2(-view.LookVector.X, -view.LookVector.Z))
+					local pitch = math.deg(math.asin(-view.LookVector.Y))
+					print(
+						("-- %s: orderings live in its Align* attributes, composed at yaw %.1f, pitch %.1f (AlignView)"):format(
+							target.id,
+							(yaw + 360) % 360,
+							pitch
+						)
+					)
+				end
+			end
+		end
 		print("-------------------")
+		if open and runSolver then
+			-- Put the presentation back the way the panel was showing it.
+			runSolver()
+		end
 	end
 
 	local connections: { RBXScriptConnection } = {}
@@ -1647,6 +1784,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 					-- Clear the whole piece: both attributes, one key.
 					target.model:SetAttribute(ATTR_FRONT, "")
 					target.model:SetAttribute(ATTR_BACK, "")
+					target.model:SetAttribute(ATTR_VIEW, nil)
 					syncPins()
 					reconcile()
 					say(`cleared every rule on {target.id}{notesSuffix()}`, true)
@@ -1673,7 +1811,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				continue
 			end
 			seen[target.model] = true
-			for _, attr in { ATTR_FRONT, ATTR_BACK } do
+			for _, attr in { ATTR_FRONT, ATTR_BACK, ATTR_VIEW } do
 				table.insert(
 					connections,
 					target.model:GetAttributeChangedSignal(attr):Connect(function()
@@ -1702,8 +1840,14 @@ function Editor.new(targets: { Target }, options: Options): Handle
 			     typed into Studio's Properties BEFORE the first open make hasWork() true with no
 			     view ever captured -- and a nil composeCF read as "at the composition view"
 			     forever, so nothing gated and the rows never deferred. ]]
-			if open and (composeCF == nil or not hasWork()) then
-				composeCF = cam:GetRenderCFrame()
+			if open then
+				--[[ The demo's settle may have realized orderings, and unrealizeOrders no-ops the
+				     instant `open` flips -- so shed the presentation HERE, or the session starts
+				     over a presented world and every authored capture reads the wrong pose. ]]
+				revertPreview()
+				if composeCF == nil or not hasWork() then
+					composeCF = cam:GetRenderCFrame()
+				end
 			end
 			gui.Enabled = open
 			if open then
@@ -1713,6 +1857,9 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				refresh()
 				print("[editor] open — ARROWS move on screen, ENTER solves, P prints the edits")
 			else
+				--[[ The presentation is handed back to the demo: it re-realizes at its own settle,
+				     from whatever view the player actually holds. ]]
+				revertPreview()
 				-- The markers live in the world, so they have to go when the panel does.
 				parkMarker(selectedMarker, nil)
 				parkMarker(referenceMarker, nil)
@@ -1724,6 +1871,33 @@ function Editor.new(targets: { Target }, options: Options): Handle
 
 		hasTiltWork = function(): boolean
 			return next(tilted) ~= nil
+		end,
+
+		realizeOrders = function()
+			if open then
+				-- While the panel is open the reconcile sweep owns the presentation.
+				return
+			end
+			revertPreview()
+			local live = cam:GetRenderCFrame()
+			table.clear(delegateHistory)
+			for _ = 1, 3 do
+				for _, target in targets do
+					applyOne(target, true, live)
+				end
+			end
+			--[[ Gameplay-time solving must leave nothing for the panel to misread: conflicts and
+			     notes computed against a roaming settle camera are not composition feedback, and
+			     the note list otherwise grows without bound across settles. ]]
+			table.clear(conflicts)
+			table.clear(sweepNotes)
+		end,
+
+		unrealizeOrders = function()
+			if open then
+				return
+			end
+			revertPreview()
 		end,
 
 		isOpen = function(): boolean
@@ -1741,6 +1915,7 @@ function Editor.new(targets: { Target }, options: Options): Handle
 				c:Disconnect()
 			end
 			table.clear(connections)
+			revertPreview()
 			selectedMarker:Destroy()
 			referenceMarker:Destroy()
 			gui:Destroy()

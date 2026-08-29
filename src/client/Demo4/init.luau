@@ -223,6 +223,11 @@ function Demo4.start(ctx: Shell.Context): boolean
 		-- the bake: sixteen graphs, computed up front
 		--------------------------------------------------------------------------------
 		local graphs: { [number]: Seam.Graph } = {}
+		--[[ Per-view ordering presentation (see demo 3): realized at each locked state's install,
+		     removed before anything that must see the authored world -- bakes and turns. ]]
+		local realizeOrders: (() -> ())? = nil
+		local unrealizeOrders: (() -> ())? = nil
+
 		local function key(camState: number, rotorState: number): number
 			return camState * 4 + rotorState
 		end
@@ -239,6 +244,10 @@ function Demo4.start(ctx: Shell.Context): boolean
 		end
 
 		local function bakeAll()
+			-- The bake must read the AUTHORED world, never a presentation.
+			if unrealizeOrders then
+				unrealizeOrders()
+			end
 			local dropped = 0
 			for rotorState = 0, 3 do
 				-- The rotor must PHYSICALLY be in each state: Seam reads live Attachment
@@ -355,6 +364,19 @@ function Demo4.start(ctx: Shell.Context): boolean
 		local function installGraph()
 			local graph = graphs[key(camState, rotorState)]
 			-- Never armed while the map is being edited.
+			--[[ The state is locked: park the camera AT the state pose before presenting, because
+			     realize solves from the live camera and two callers run before the frame loop has
+			     written it -- boot (lobby camera) and reset -- which silently skipped the starting
+			     view's orderings until the player turned away and back. ]]
+			if turning <= 0 then
+				cam.CFrame = cframeForYaw(yawNow)
+			end
+			if unrealizeOrders then
+				unrealizeOrders()
+			end
+			if not editing and realizeOrders then
+				realizeOrders()
+			end
 			traverser.setGraph(if editing then nil else graph, ctx.player.Character)
 			table.clear(liveBars)
 			for _, edge in graph.edges do
@@ -399,6 +421,10 @@ function Demo4.start(ctx: Shell.Context): boolean
 		local function beginTurn(delta: number)
 			if turning > 0 then
 				return
+			end
+			-- The view is leaving: its ordering presentation goes with it.
+			if unrealizeOrders then
+				unrealizeOrders()
 			end
 			fromYaw = math.rad(TUNE.yawDeg[camState + 1])
 			camState = (camState + delta) % 4
@@ -615,6 +641,30 @@ function Demo4.start(ctx: Shell.Context): boolean
 			camera = cam,
 			playerGui = ctx.playerGui,
 			references = editorReferences,
+			--[[ The fall catch's safe spot may have been latched while standing on a PRESENTED
+			     piece; when the presentation reverts, that spot points at empty air where the
+			     piece used to be, and the catch would loop the player there. Re-base it with the
+			     piece it was latched over. ]]
+			onPreviewReverted = function(model: PVInstance, delta: Vector3)
+				local cf: CFrame, size: Vector3
+				if model:IsA("Model") then
+					cf, size = model:GetBoundingBox()
+				elseif model:IsA("BasePart") then
+					cf, size = model.CFrame, model.Size
+				else
+					return
+				end
+				local p = cf:PointToObjectSpace(lastSafe.Position)
+				if
+					math.abs(p.X) <= size.X / 2 + 3
+					and math.abs(p.Z) <= size.Z / 2 + 3
+					and p.Y >= 0
+					and p.Y <= size.Y / 2 + 8
+				then
+					lastSafe -= delta
+				end
+			end,
+
 			-- Sixteen graphs are a snapshot of the geometry, so a moved surface invalidates all of
 			-- them. Re-baking is milliseconds and it keeps the lit seams honest.
 			onChanged = function()
@@ -635,6 +685,11 @@ function Demo4.start(ctx: Shell.Context): boolean
 			onClose = function()
 				editing = false
 				setWalkable(turning <= 0)
+				--[[ Any bake taken while the panel was open saw the editor's preview offsets;
+				     the close has just reverted them, so re-bake from the authored world before
+				     installing. ]]
+				bakeAll()
+				level.setRotor(rotorState)
 				installGraph()
 				hud.setHint(HINT)
 			end,
@@ -645,6 +700,8 @@ function Demo4.start(ctx: Shell.Context): boolean
 			end,
 		})
 		s.add(editor.destroy)
+		realizeOrders = editor.realizeOrders
+		unrealizeOrders = editor.unrealizeOrders
 
 		local inputConn = UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
 			if processed then
